@@ -1,0 +1,21 @@
+{
+  "name": "txlit",
+  "description": "Inter-agent messaging system for Claude Code",
+  "version": "1.0.0",
+  "author": {
+    "name": "god"
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/hook.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
