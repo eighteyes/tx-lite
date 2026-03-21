@@ -1,11 +1,81 @@
 # Human Review Steps
 
+## Turn 0: SSH + GitHub Push (2026-02-23)
+
+### Fix SSH Agent
+- [ ] Load SSH key:
+```bash
+ssh-add ~/.ssh/id_ed25519
+```
+- [ ] Verify:
+```bash
+ssh -T git@github.com
+```
+
+### Push tx-lite
+- [ ] Set remote back to SSH:
+```bash
+git -C ~/projects/tx-lite remote set-url origin git@github.com:eighteyes/tx-lite.git
+```
+- [ ] Push:
+```bash
+git -C ~/projects/tx-lite push -u origin main
+```
+- [ ] Verify repo: https://github.com/eighteyes/tx-lite
+
+### Push know-cli
+- [ ] Set remote back to SSH:
+```bash
+git -C ~/projects/know-cli remote set-url origin git@github.com:eighteyes/know-cli.git
+```
+- [ ] Push:
+```bash
+git -C ~/projects/know-cli push origin main
+```
+- [ ] Verify repo: https://github.com/eighteyes/know-cli
+
+---
+
+## Plugin Marketplace Install (2026-02-23, commit 4614336 / ef58561)
+
+### txlit Plugin
+- [ ] Add marketplace:
+```
+/plugin marketplace add eighteyes/tx-lite
+```
+- [ ] Install plugin:
+```
+/plugin install txlit@txlit
+```
+- [ ] Verify hook registered (should see txlit in UserPromptSubmit):
+```bash
+jq '.hooks.UserPromptSubmit' ~/.claude/settings.json
+```
+- [ ] Test: open Claude in any project, send a message to it, confirm delivery on next prompt
+
+### know-tool Plugin
+- [ ] Add marketplace:
+```
+/plugin marketplace add eighteyes/know-cli
+```
+- [ ] Install plugin:
+```
+/plugin install know-tool@know-cli
+```
+- [ ] Verify commands available:
+```
+/know:list
+```
+- [ ] Verify skill loaded (ask Claude about spec graphs, should reference know-tool)
+
+---
+
 ## txlit v1 - Inter-Agent Messaging (2026-02-13)
 
 ### Setup Verification
 - [ ] Symlink txlit to PATH:
 ```bash
-ln -sf ~/projects/ai-jank/tx-lite/bin/txlit ~/.local/bin/txlit
+ln -sf ~/projects/tx-lite/bin/txlit ~/.local/bin/txlit
 ```
 - [ ] Verify txlit is accessible:
 ```bash
@@ -27,8 +97,8 @@ grep "txlit" ~/.claude/CLAUDE.md
 ### Send/Receive Roundtrip
 - [ ] Create a test handoff in any project:
 ```bash
-mkdir -p ~/projects/some-project/.ai/handoffs
-echo "# Test\nDo the thing." > ~/projects/some-project/.ai/handoffs/2026-02-13-test.md
+mkdir -p ~/projects/some-project/.ai/tx/msgs
+echo "# Test\nDo the thing." > ~/projects/some-project/.ai/tx/msgs/2026-02-13-test.md
 ```
 - [ ] Send the message:
 ```bash
@@ -59,7 +129,7 @@ txlit clear ~/projects/some-project
 
 ### Real Agent-to-Agent Test
 - [ ] Open Claude in project A
-- [ ] Have agent A write a handoff file to project B's .ai/handoffs/
+- [ ] Have agent A write a handoff file to project B's `.ai/tx/msgs/`
 - [ ] Have agent A run `txlit send <project-B-path> <handoff-file>`
 - [ ] Open Claude in project B
 - [ ] Verify agent B receives and can act on the instructions

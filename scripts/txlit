@@ -18,6 +18,7 @@ MESSAGES_FILE="${CONFIG_DIR}/messages.json"
 REGISTRY_FILE="${CONFIG_DIR}/registry.json"
 CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
 CLAUDE_MD="${HOME}/.claude/CLAUDE.md"
+MSGS_DIR="${CONFIG_DIR}/msgs"
 INSTALL_DIR="${HOME}/.local/bin"
 
 # Resolve script location (follows one level of symlink)
@@ -61,13 +62,31 @@ resolve_target() {
     echo "$target"
 }
 
+# Resolve a target path to a namespace for central message storage
+# Checks registry for a name mapping to this path, falls back to basename
+resolve_namespace() {
+    local target_path="$1"
+    if [ -f "$REGISTRY_FILE" ]; then
+        local name
+        name="$(jq -r --arg p "$target_path" \
+          'to_entries[] | select((.value | if type == "object" then .path else . end) == $p) | .key' \
+          "$REGISTRY_FILE" 2>/dev/null | head -1)"
+        if [ -n "$name" ]; then
+            echo "$name"
+            return
+        fi
+    fi
+    basename "$target_path"
+}
+
 # --- init -----------------------------------------------------------
 cmd_init() {
     echo "Initializing txlit..."
     echo ""
 
-    # Config directory
+    # Config directory + central message store
     mkdir -p "$CONFIG_DIR"
+    mkdir -p "$MSGS_DIR"
     echo "  [ok] Config directory: ${CONFIG_DIR}"
 
     # Messages registry
@@ -115,7 +134,7 @@ cmd_init() {
         if grep -q "txlit" "$CLAUDE_MD" 2>/dev/null; then
             echo "  [--] CLAUDE.md already has txlit instructions"
         else
-            printf '\n## Inter-Agent Messaging\nThis machine uses txlit for inter-agent messaging. Run `txlit -h` for usage.\n' >> "$CLAUDE_MD"
+            printf '\n## Inter-Agent Messaging\nThis machine uses txlit for inter-agent messaging. Use `txlit compose <target> <file> <<EOF` to send messages across projects. All messages stored centrally in ~/.config/txlit/msgs/ (sandbox-safe). Run `txlit who` for targets, `txlit -h` for full usage.\n' >> "$CLAUDE_MD"
             echo "  [ok] Added txlit section to CLAUDE.md"
         fi
     else
@@ -124,6 +143,166 @@ cmd_init() {
 
     echo ""
     echo "Done. Run 'txlit -h' for usage."
+}
+
+# --- inbox ----------------------------------------------------------
+cmd_inbox() {
+    local project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+    project_dir="$(cd "$project_dir" 2>/dev/null && pwd)" || project_dir="$PWD"
+
+    if [ ! -f "$MESSAGES_FILE" ]; then
+        echo "No messages (txlit not initialized)"
+        return
+    fi
+
+    local unread_count read_count
+    unread_count="$(jq --arg p "$project_dir" '[.[$p] // [] | .[] | select(.status == "unread")] | length' "$MESSAGES_FILE")"
+    read_count="$(jq --arg p "$project_dir" '[.[$p] // [] | .[] | select(.status == "read")] | length' "$MESSAGES_FILE")"
+
+    if [ "$unread_count" = "0" ] && [ "$read_count" = "0" ]; then
+        echo "Inbox empty"
+        return
+    fi
+
+    if [ "$unread_count" != "0" ]; then
+        echo "Unread (${unread_count}):"
+        jq -r --arg p "$project_dir" \
+          '.[$p] // [] | .[] | select(.status == "unread") | "  [\(.id)] from \(.from | split("/") | last)  \(.timestamp)  \(.handoff | split("/") | last)"' \
+          "$MESSAGES_FILE"
+    fi
+
+    if [ "$read_count" != "0" ]; then
+        echo "Read (${read_count}):"
+        jq -r --arg p "$project_dir" \
+          '.[$p] // [] | .[] | select(.status == "read") | "  [\(.id)] from \(.from | split("/") | last)  \(.timestamp)  \(.handoff | split("/") | last)"' \
+          "$MESSAGES_FILE"
+    fi
+}
+
+# --- compose --------------------------------------------------------
+cmd_compose() {
+    local deliver=false
+    local target=""
+    local filename=""
+
+    # Parse flags
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --deliver) deliver=true; shift ;;
+            -*) echo "Unknown flag: $1" >&2; exit 1 ;;
+            *)
+                if [ -z "$target" ]; then target="$1"
+                elif [ -z "$filename" ]; then filename="$1"
+                fi
+                shift ;;
+        esac
+    done
+
+    if [ -z "$target" ] || [ -z "$filename" ]; then
+        echo "Usage: txlit compose [--deliver] <target|name> <filename>" >&2
+        echo "  Reads message body from stdin, writes file, registers message." >&2
+        echo "" >&2
+        echo "  --deliver  Launch a new kitty pane and feed the message to claude" >&2
+        echo "  target     Path or registered name (see: txlit who)" >&2
+        echo "  filename   Name for the handoff file (e.g., 2026-03-11-bug-report.md)" >&2
+        echo "" >&2
+        echo "Example:" >&2
+        echo "  txlit compose --deliver backend 2026-03-11-auth-bug.md <<'EOF'" >&2
+        echo "  # Auth token expiring early" >&2
+        echo "  JWT tokens expire after 5 min instead of 60." >&2
+        echo "  EOF" >&2
+        exit 1
+    fi
+
+    # Resolve registered name → path
+    local target_path
+    target_path="$(resolve_target "$target")"
+
+    # Resolve to absolute path
+    target_path="$(cd "$target_path" 2>/dev/null && pwd)" || {
+        echo "Error: target path does not exist: $target" >&2
+        exit 1
+    }
+
+    # Ensure central msgs directory exists (namespaced by target)
+    local namespace
+    namespace="$(resolve_namespace "$target_path")"
+    local msgs_dir="${MSGS_DIR}/${namespace}"
+    mkdir -p "$msgs_dir"
+
+    # Write stdin to handoff file in central store
+    local handoff_path="${msgs_dir}/${filename}"
+    cat > "$handoff_path"
+
+    if [ ! -s "$handoff_path" ]; then
+        rm -f "$handoff_path"
+        echo "Error: empty message body (nothing on stdin)" >&2
+        exit 1
+    fi
+
+    # Ensure initialized
+    if [ ! -f "$MESSAGES_FILE" ]; then
+        echo "Error: txlit not initialized. Run 'txlit init' first." >&2
+        exit 1
+    fi
+
+    # Generate message ID
+    local msg_id
+    msg_id="$(uuidgen | tr '[:upper:]' '[:lower:]' | cut -c1-8)"
+
+    # Sender = current project or working directory
+    local from_path="${CLAUDE_PROJECT_DIR:-$PWD}"
+
+    # Timestamp
+    local timestamp
+    timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+    # Append to registry (atomic write)
+    jq --arg target "$target_path" \
+       --arg id "$msg_id" \
+       --arg from "$from_path" \
+       --arg handoff "$handoff_path" \
+       --arg ts "$timestamp" \
+       '.[$target] //= [] | .[$target] += [{"id":$id,"from":$from,"handoff":$handoff,"timestamp":$ts,"status":"unread"}]' \
+       "$MESSAGES_FILE" | json_write "$MESSAGES_FILE"
+
+    echo "Composed and registered message ${msg_id}"
+    echo "  to:      ${target_path}"
+    echo "  file:    ${filename}"
+
+    # Deliver: launch kitty pane alongside existing claudes, start claude with file
+    if [ "$deliver" = true ]; then
+        if ! command -v kitty > /dev/null 2>&1; then
+            echo "  [!!] --deliver requires kitty with remote control enabled" >&2
+            return
+        fi
+
+        # Find an existing pane in the target's directory to anchor the new pane
+        local anchor_id
+        anchor_id="$(kitty @ ls 2>/dev/null | jq -r --arg cwd "$target_path" \
+          '[.[].tabs[].windows[] | select(.cwd == $cwd)] | first | .id // empty' 2>/dev/null)"
+
+        local pane_id
+        if [ -n "$anchor_id" ]; then
+            # Open as a new tab in the same OS window as the existing pane
+            pane_id="$(kitty @ launch --type=tab --match "id:${anchor_id}" \
+              --cwd "$target_path" --title "txlit: ${filename}" 2>/dev/null)"
+        else
+            # No existing pane — open a new OS window
+            pane_id="$(kitty @ launch --type=os-window \
+              --cwd "$target_path" --title "txlit: ${filename}" 2>/dev/null)"
+        fi
+
+        if [ -z "$pane_id" ]; then
+            echo "  [!!] kitty remote control failed — is allow_remote_control enabled?" >&2
+            return
+        fi
+
+        # Start claude and feed it the file reference as first message
+        kitty @ send-text --match "id:${pane_id}" "claude \"@${handoff_path}\"\n" 2>/dev/null
+
+        echo "  deliver: pane ${pane_id} launched at ${target_path}"
+    fi
 }
 
 # --- send -----------------------------------------------------------
@@ -135,7 +314,7 @@ cmd_send() {
         echo "Usage: txlit send <target|name> <handoff-file>" >&2
         echo "" >&2
         echo "  target   Path or registered name (see: txlit who)" >&2
-        echo "  handoff  Filename in <target>/.ai/tx/msgs/" >&2
+        echo "  handoff  Filename in ~/.config/txlit/msgs/<namespace>/" >&2
         exit 1
     fi
 
@@ -148,11 +327,21 @@ cmd_send() {
         exit 1
     }
 
-    # Check handoff file exists
-    local handoff_path="${target_path}/.ai/tx/msgs/${handoff_file}"
+    # Check handoff file in central store
+    local namespace
+    namespace="$(resolve_namespace "$target_path")"
+    local handoff_path="${MSGS_DIR}/${namespace}/${handoff_file}"
     if [ ! -f "$handoff_path" ]; then
         echo "Error: handoff file not found: ${handoff_path}" >&2
         exit 1
+    fi
+
+    # Clean front matter: agents in tx sessions may write tx/core instead of core/core
+    if echo "$target_path" | grep -qi "tx"; then
+        if head -20 "$handoff_path" | grep -q 'tx/core'; then
+            sed -i '' 's|tx/core|core/core|g' "$handoff_path"
+            echo "  [fix] Rewrote tx/core → core/core in front matter"
+        fi
     fi
 
     # Ensure initialized
@@ -475,35 +664,111 @@ USAGE:
   txlit intent <name> <intent>        Update a project's intent
   txlit unregister <name>             Remove a named project
   txlit who                           List registered names + intents
-  txlit send <target|name> <handoff>  Register a message for a project
+  txlit inbox                          Check messages for current project
+  txlit compose [--deliver] <target|name> <file>
+                                     Write + register a message from stdin
+                                     --deliver: launch kitty pane, start claude
+  txlit send <target|name> <handoff>  Register an existing handoff file
   txlit list [path|name]              Show pending messages
   txlit clear <path|name> [id]        Remove messages
   txlit help                          Show this help
 
 WORKFLOW:
   1. Register project names:    txlit register backend ~/projects/backend
-  2. Agent writes handoff:      <target>/.ai/tx/msgs/YYYY-MM-DD-name.md
-  3. Agent sends message:       txlit send backend 2026-02-13-setup-auth.md
-  4. Receiving agent gets it on next prompt
-  5. Clear after processing:    txlit clear backend
+  2. Compose a message:         txlit compose backend msg.md <<< "content"
+  3. Receiving agent gets it on next prompt
+  4. Clear after processing:    txlit clear backend
+
+  Alternative (pre-written file):
+  1. Write handoff to:          ~/.config/txlit/msgs/<name>/YYYY-MM-DD-name.md
+  2. Register it:               txlit send backend 2026-02-13-setup-auth.md
 
 FILES:
-  ~/.config/txlit/messages.json      Global message registry
-  ~/.config/txlit/registry.json      Named project aliases
-  ~/.config/txlit/hook.sh            Hook script (installed by init)
-  <project>/.ai/tx/msgs/*.md        Handoff instruction files
+  ~/.config/txlit/messages.json           Global message registry
+  ~/.config/txlit/registry.json           Named project aliases
+  ~/.config/txlit/hook.sh                 Hook script (installed by init)
+  ~/.config/txlit/msgs/<namespace>/*.md   Handoff instruction files
 
 EXAMPLES:
+  txlit compose backend 2026-03-11-auth-bug.md <<'EOF'
+  # Auth bug: tokens expire early
+  JWT tokens expire after 5 min instead of 60.
+  EOF
+
   txlit register prototypologist ~/projects/prototypologist "AI prototyping sandbox"
-  txlit intent tx-core "Core transaction engine"
   txlit send prototypologist 2026-02-13-setup-auth.md
-  txlit send ~/projects/backend 2026-02-13-setup-auth.md
   txlit list
-  txlit list prototypologist
   txlit clear prototypologist
-  txlit clear prototypologist a1b2c3d4
   txlit who
 HELP
+}
+
+# --- agent-help -----------------------------------------------------
+cmd_agent_help() {
+    cat << 'AGENTHELP'
+# txlit — Inter-Agent Messaging for Claude Code
+
+Send messages between Claude Code projects. Messages auto-deliver on the recipient's next prompt via a UserPromptSubmit hook.
+
+## Checking Your Inbox
+
+```bash
+txlit inbox
+```
+
+Shows unread and read messages for the current project.
+
+## Sending Messages
+
+Use `txlit compose` to write and register a message in one step. Messages are stored centrally in `~/.config/txlit/msgs/` — no files are written to the target project's directory.
+
+```bash
+txlit compose <target> <filename> <<'EOF'
+Your message content here.
+EOF
+
+# --deliver: also launch a new kitty pane and start claude with the message
+txlit compose --deliver <target> <filename> <<'EOF'
+Your message content here.
+EOF
+```
+
+- `target`: registered project name (run `txlit who` to list)
+- `filename`: convention is `YYYY-MM-DD-description.md`
+
+### Example
+
+```bash
+txlit compose backend 2026-03-11-auth-bug.md <<'EOF'
+# Auth tokens expire early
+
+JWT tokens expire after 5 minutes instead of the configured 60.
+Reproduction: login, wait 6 minutes, attempt API call → 401.
+
+## Suggested fix
+Check `TOKEN_EXPIRY` env var in `src/auth/jwt.ts`.
+EOF
+```
+
+## Commands
+
+| Command | Purpose |
+|---------|---------|
+| `txlit inbox` | Check messages for current project |
+| `txlit compose <target> <file>` | Write + register message from stdin |
+| `txlit send <target> <file>` | Register a pre-written handoff file |
+| `txlit who` | List registered projects |
+| `txlit list [target]` | Show pending messages for a target |
+| `txlit clear <target> [id]` | Remove delivered messages |
+
+## Rules
+
+- Use `compose` for cross-project messages (bypasses sandbox restrictions)
+- Use `send` only when the handoff file already exists in `~/.config/txlit/msgs/<namespace>/`
+- Run `txlit who` before sending to verify the target name exists
+- Filenames follow `YYYY-MM-DD-description.md` convention
+- Messages are markdown — include enough context for the recipient to act
+AGENTHELP
 }
 
 # --- routing --------------------------------------------------------
@@ -515,9 +780,12 @@ case "${1:-}" in
     intent)         shift; cmd_intent "$@" ;;
     unregister)     shift; cmd_unregister "$@" ;;
     who)            shift; cmd_who "$@" ;;
+    inbox)          shift; cmd_inbox "$@" ;;
+    compose)        shift; cmd_compose "$@" ;;
     send)           shift; cmd_send "$@" ;;
     list|ls)        shift; cmd_list "$@" ;;
     clear|rm)       shift; cmd_clear "$@" ;;
+    agent-help|--agent-help) cmd_agent_help ;;
     help|-h|--help) cmd_help ;;
     "")             cmd_help ;;
     *)              echo "Unknown command: $1" >&2; cmd_help >&2; exit 1 ;;

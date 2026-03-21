@@ -1,7 +1,7 @@
 {
   "name": "txlit",
   "owner": {
-    "name": "god"
+    "name": "eighteyes"
   },
   "metadata": {
     "description": "Inter-agent messaging system for Claude Code",

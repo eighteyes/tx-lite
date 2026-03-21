@@ -1,10 +1,11 @@
 {
   "name": "txlit",
   "description": "Inter-agent messaging system for Claude Code",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": {
-    "name": "god"
+    "name": "eighteyes"
   },
+  "instructions": "./CLAUDE.md",
   "hooks": {
     "UserPromptSubmit": [
       {
