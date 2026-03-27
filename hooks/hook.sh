@@ -12,6 +12,7 @@ set -uo pipefail
 
 CONFIG_DIR="${HOME}/.config/txlit"
 MESSAGES_FILE="${CONFIG_DIR}/messages.json"
+INSTALL_DIR="${HOME}/.local/bin"
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-}"
 
 # Always exit 0 — hooks must never block prompts
@@ -19,6 +20,48 @@ trap 'exit 0' ERR
 
 # No project dir = nothing to check
 [ -z "$PROJECT_DIR" ] && exit 0
+
+# Lazy init: bootstrap config dir and CLI symlink on first run
+if [ ! -d "$CONFIG_DIR" ]; then
+    mkdir -p "${CONFIG_DIR}/msgs"
+    echo '{}' > "$MESSAGES_FILE"
+    echo '{}' > "${CONFIG_DIR}/registry.json"
+fi
+
+# Symlink CLI to PATH if not already available
+if ! command -v txlit > /dev/null 2>&1; then
+    # Resolve script dir: hook lives at <root>/hooks/hook.sh, scripts at <root>/scripts/
+    HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+    SCRIPT_SOURCE="${HOOK_DIR}/../scripts/txlit"
+    # Follow one level of symlink on the hook itself (plugin cache may symlink hooks/)
+    if [ ! -f "$SCRIPT_SOURCE" ] && [ -L "$0" ]; then
+        HOOK_DIR="$(cd "$(dirname "$(readlink "$0")")" && pwd)"
+        SCRIPT_SOURCE="${HOOK_DIR}/../scripts/txlit"
+    fi
+    if [ -f "$SCRIPT_SOURCE" ]; then
+        SCRIPT_SOURCE="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)/txlit"
+        mkdir -p "$INSTALL_DIR"
+        ln -sf "$SCRIPT_SOURCE" "${INSTALL_DIR}/txlit"
+    fi
+fi
+
+# Auto-register current project by basename if not already known
+REGISTRY_FILE="${CONFIG_DIR}/registry.json"
+if [ -f "$REGISTRY_FILE" ]; then
+    already="$(jq -r --arg p "$PROJECT_DIR" \
+      'to_entries[] | select((.value | if type == "object" then .path else . end) == $p) | .key' \
+      "$REGISTRY_FILE" 2>/dev/null | head -1)"
+    if [ -z "$already" ]; then
+        proj_name="$(basename "$PROJECT_DIR")"
+        # Avoid collisions: if name taken by a different path, suffix with hash
+        existing="$(jq -r --arg n "$proj_name" '.[$n] | if type == "object" then .path else . end // empty' "$REGISTRY_FILE" 2>/dev/null)"
+        if [ -n "$existing" ] && [ "$existing" != "$PROJECT_DIR" ]; then
+            proj_name="${proj_name}-$(echo "$PROJECT_DIR" | shasum | cut -c1-4)"
+        fi
+        jq --arg name "$proj_name" --arg path "$PROJECT_DIR" \
+          '.[$name] = {"path":$path}' "$REGISTRY_FILE" > "${REGISTRY_FILE}.tmp" && mv "${REGISTRY_FILE}.tmp" "$REGISTRY_FILE"
+    fi
+fi
 
 # No messages file = nothing to deliver
 [ -f "$MESSAGES_FILE" ] || exit 0

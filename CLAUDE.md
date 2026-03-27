@@ -10,35 +10,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a pure bash project. There is no build step, no npm, no compilation. Scripts run directly.
 
-**Installation:**
-```bash
-./plugins/txlit/scripts/txlit install
-# or symlink manually
-ln -sf /path/to/tx-lite/bin/txlit ~/.local/bin/txlit
-```
-
 **Dependencies:** `jq`, `uuidgen`, `date`, `sed`, `grep` (standard macOS tools)
 
 ## Architecture
 
 ### Core Components
 
-- **`bin/txlit`** — Main CLI (~769 lines of bash). All subcommands live here. Entry point for everything.
-- **`lib/hook.sh`** — Hook script that runs on `UserPromptSubmit`. Reads unread messages from registry and outputs them into the prompt context.
-- **`plugins/txlit/`** — Plugin marketplace package (mirrors `bin/` and `lib/` for distribution).
+- **`scripts/txlit`** — Main CLI. All subcommands live here. Entry point for everything.
+- **`hooks/hook.sh`** — Hook script that runs on `UserPromptSubmit`. Handles lazy init, auto-registration, and message delivery.
+
+### Hook Bootstrap (lazy init)
+
+On first `UserPromptSubmit` after plugin install, the hook automatically:
+1. Creates `~/.config/txlit/` with `messages.json`, `registry.json`, and `msgs/`
+2. Symlinks `scripts/txlit` to `~/.local/bin/txlit` (if `txlit` not already on PATH)
+3. Auto-registers the current project by directory basename (with hash suffix on collision)
+
+No manual `txlit install` or `txlit register` needed for basic usage.
 
 ### Data Flow
 
 1. **Sending**: `txlit compose/send` → writes handoff `.md` file to `~/.config/txlit/msgs/<namespace>/` → registers pointer in `~/.config/txlit/messages.json`
 2. **Delivery**: Claude Code fires `UserPromptSubmit` hook → hook reads `messages.json` → outputs handoff content → marks message as read
-3. **Registry**: `~/.config/txlit/registry.json` maps project name aliases to absolute paths
+3. **Registry**: `~/.config/txlit/registry.json` maps project name aliases to absolute paths (auto-populated by hook, customizable via `txlit register`)
 
 ### Global Config (written to user's home, not this repo)
 
 ```
 ~/.config/txlit/messages.json        # Message queue (project path → [{id, from, handoff, status}])
-~/.config/txlit/registry.json        # Name → path aliases
-~/.config/txlit/hook.sh              # Installed hook (copy of lib/hook.sh)
+~/.config/txlit/registry.json        # Name → path aliases (auto-populated)
 ~/.config/txlit/msgs/<namespace>/    # Handoff files, namespaced by target
 ```
 
@@ -56,7 +56,7 @@ All registry/config writes use temp file + `mv` for atomicity (prevents corrupti
 |-------|----------|
 | Management | `init`, `install`, `uninstall` |
 | Registry | `register`, `unregister`, `intent`, `who` |
-| Messaging | `compose`, `send`, `inbox`, `list`, `clear` |
+| Messaging | `grab`, `compose`, `relay`, `send`, `inbox`, `list`, `clear` |
 | Help | `help`, `--agent-help` |
 
 ## Key Constraints
@@ -64,8 +64,8 @@ All registry/config writes use temp file + `mv` for atomicity (prevents corrupti
 - **Bash 3.2+ compatible** (macOS default). Avoid bash 4+ features (`declare -A`, etc.).
 - Hook output must never block or fail a prompt — wrap in guards, always exit 0.
 - `CLAUDE_PROJECT_DIR` env var is available inside hook execution (set by Claude Code).
-- The hook is registered in Claude Code's `~/.claude/settings.json` under `.hooks.UserPromptSubmit`.
+- The hook is registered via the plugin manifest in `.claude-plugin/plugin.json`.
 
 ## Knowledge Base
 
-`.ai/know/` contains spec graphs, features, and architecture docs for AI agents working on this project. The TypeScript file at `.ai/scripts/tx-context-hook.ts` is a context injection helper used by the TX system itself (not txlit's source).
+`.ai/know/` contains spec graphs, features, and architecture docs for AI agents working on this project.

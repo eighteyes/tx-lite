@@ -5,6 +5,8 @@
 # Responsibilities:
 # - init: one-time global setup (config dir, hook, settings.json, CLAUDE.md)
 # - send: register a handoff file pointer in the global registry
+# - grab: pull terminal output from kitty into current session (stdout)
+# - relay: grab terminal output from kitty and send as a message
 # - list: display pending messages
 # - clear: remove messages from registry
 # - install: init + symlink to PATH
@@ -38,7 +40,7 @@ get_script_dir() {
 }
 
 SCRIPT_DIR="$(get_script_dir)"
-HOOK_SOURCE="${SCRIPT_DIR}/../lib/hook.sh"
+HOOK_SOURCE="${SCRIPT_DIR}/../hooks/hook.sh"
 
 # Atomic JSON write: stdin → file
 json_write() {
@@ -665,9 +667,15 @@ USAGE:
   txlit unregister <name>             Remove a named project
   txlit who                           List registered names + intents
   txlit inbox                          Check messages for current project
+  txlit grab [--extent <type>] [--match <window>]
+                                     Pull terminal output from kitty into current session
+                                     extent: last_cmd_output (default), selection, screen
   txlit compose [--deliver] <target|name> <file>
                                      Write + register a message from stdin
                                      --deliver: launch kitty pane, start claude
+  txlit relay [--deliver] [--extent <type>] [--match <window>] <target> [label]
+                                     Grab kitty terminal output and send as message
+                                     extent: last_cmd_output (default), selection, screen
   txlit send <target|name> <handoff>  Register an existing handoff file
   txlit list [path|name]              Show pending messages
   txlit clear <path|name> [id]        Remove messages
@@ -755,7 +763,9 @@ EOF
 | Command | Purpose |
 |---------|---------|
 | `txlit inbox` | Check messages for current project |
+| `txlit grab` | Pull kitty terminal output into current session |
 | `txlit compose <target> <file>` | Write + register message from stdin |
+| `txlit relay <target> [label]` | Grab kitty terminal output and send as message |
 | `txlit send <target> <file>` | Register a pre-written handoff file |
 | `txlit who` | List registered projects |
 | `txlit list [target]` | Show pending messages for a target |
@@ -771,6 +781,137 @@ EOF
 AGENTHELP
 }
 
+# --- grab -----------------------------------------------------------
+cmd_grab() {
+    local extent="last_cmd_output"
+    local match_arg=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --extent)  extent="$2"; shift 2 ;;
+            --match|-m) match_arg="$2"; shift 2 ;;
+            -*) echo "Unknown flag: $1" >&2; exit 1 ;;
+            *)  echo "Unexpected argument: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    if ! command -v kitty > /dev/null 2>&1; then
+        echo "Error: kitty not found" >&2
+        exit 1
+    fi
+
+    local kitty_cmd="kitty @ get-text --extent ${extent}"
+    if [ -n "$match_arg" ]; then
+        kitty_cmd="${kitty_cmd} --match ${match_arg}"
+    else
+        kitty_cmd="${kitty_cmd} --match recent:1"
+    fi
+
+    local captured
+    captured="$(eval "$kitty_cmd" 2>&1)" || {
+        echo "Error: kitty remote control failed" >&2
+        echo "  Is allow_remote_control enabled? Is shell_integration active?" >&2
+        echo "  Detail: ${captured}" >&2
+        exit 1
+    }
+
+    if [ -z "$captured" ]; then
+        echo "Error: no output captured from kitty" >&2
+        exit 1
+    fi
+
+    printf '%s\n' "$captured"
+}
+
+# --- relay ----------------------------------------------------------
+cmd_relay() {
+    local target=""
+    local label=""
+    local extent="last_cmd_output"
+    local deliver=false
+    local match_arg=""
+
+    # Parse flags
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --deliver) deliver=true; shift ;;
+            --extent)  extent="$2"; shift 2 ;;
+            --match|-m) match_arg="$2"; shift 2 ;;
+            -*) echo "Unknown flag: $1" >&2; exit 1 ;;
+            *)
+                if [ -z "$target" ]; then target="$1"
+                elif [ -z "$label" ]; then label="$1"
+                fi
+                shift ;;
+        esac
+    done
+
+    if [ -z "$target" ]; then
+        echo "Usage: txlit relay [--deliver] [--extent <type>] [--match <window>] <target> [label]" >&2
+        echo "" >&2
+        echo "  Grabs output from kitty terminal and sends it as a message." >&2
+        echo "" >&2
+        echo "  target     Registered name or path (see: txlit who)" >&2
+        echo "  label      Short descriptor for filename (default: relay)" >&2
+        echo "  --deliver  Also launch kitty pane and start claude with message" >&2
+        echo "  --extent   Kitty get-text extent (default: last_cmd_output)" >&2
+        echo "             Options: last_cmd_output, last_non_empty_output, screen, selection" >&2
+        echo "  --match    Kitty window match expression (default: recent:1)" >&2
+        echo "" >&2
+        echo "Examples:" >&2
+        echo "  txlit relay backend                    # last cmd output → backend" >&2
+        echo "  txlit relay backend build-error        # with label" >&2
+        echo "  txlit relay --extent selection backend  # selected text → backend" >&2
+        echo "  txlit relay --match title:server backend # from specific window" >&2
+        exit 1
+    fi
+
+    # Verify kitty remote control
+    if ! command -v kitty > /dev/null 2>&1; then
+        echo "Error: kitty not found" >&2
+        exit 1
+    fi
+
+    # Build kitty get-text command
+    local kitty_cmd="kitty @ get-text --extent ${extent}"
+    if [ -n "$match_arg" ]; then
+        kitty_cmd="${kitty_cmd} --match ${match_arg}"
+    else
+        kitty_cmd="${kitty_cmd} --match recent:1"
+    fi
+
+    # Grab text from kitty
+    local captured
+    captured="$(eval "$kitty_cmd" 2>&1)" || {
+        echo "Error: kitty remote control failed" >&2
+        echo "  Is allow_remote_control enabled? Is shell_integration active?" >&2
+        echo "  Detail: ${captured}" >&2
+        exit 1
+    }
+
+    if [ -z "$captured" ]; then
+        echo "Error: no output captured from kitty" >&2
+        exit 1
+    fi
+
+    # Generate filename
+    local date_prefix
+    date_prefix="$(date +"%Y-%m-%d")"
+    local safe_label="${label:-relay}"
+    safe_label="$(echo "$safe_label" | tr ' /' '-' | tr '[:upper:]' '[:lower:]')"
+    local filename="${date_prefix}-${safe_label}.md"
+
+    # Build compose args
+    local compose_args=()
+    if [ "$deliver" = true ]; then
+        compose_args+=(--deliver)
+    fi
+    compose_args+=("$target" "$filename")
+
+    # Pipe captured output into compose
+    echo "$captured" | cmd_compose "${compose_args[@]}"
+}
+
 # --- routing --------------------------------------------------------
 case "${1:-}" in
     install)        shift; cmd_install "$@" ;;
@@ -782,6 +923,8 @@ case "${1:-}" in
     who)            shift; cmd_who "$@" ;;
     inbox)          shift; cmd_inbox "$@" ;;
     compose)        shift; cmd_compose "$@" ;;
+    grab)           shift; cmd_grab "$@" ;;
+    relay)          shift; cmd_relay "$@" ;;
     send)           shift; cmd_send "$@" ;;
     list|ls)        shift; cmd_list "$@" ;;
     clear|rm)       shift; cmd_clear "$@" ;;

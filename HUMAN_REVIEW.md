@@ -95,14 +95,9 @@ grep "txlit" ~/.claude/CLAUDE.md
 ```
 
 ### Send/Receive Roundtrip
-- [ ] Create a test handoff in any project:
+- [ ] Compose a test message to any registered project:
 ```bash
-mkdir -p ~/projects/some-project/.ai/tx/msgs
-echo "# Test\nDo the thing." > ~/projects/some-project/.ai/tx/msgs/2026-02-13-test.md
-```
-- [ ] Send the message:
-```bash
-txlit send ~/projects/some-project 2026-02-13-test.md
+txlit compose some-project 2026-02-13-test.md <<< "# Test\nDo the thing."
 ```
 - [ ] Verify it shows in list:
 ```bash
@@ -129,7 +124,6 @@ txlit clear ~/projects/some-project
 
 ### Real Agent-to-Agent Test
 - [ ] Open Claude in project A
-- [ ] Have agent A write a handoff file to project B's `.ai/tx/msgs/`
-- [ ] Have agent A run `txlit send <project-B-path> <handoff-file>`
+- [ ] Have agent A compose a message to project B: `txlit compose <project-B-name> <handoff-file> <<'EOF' ... EOF`
 - [ ] Open Claude in project B
 - [ ] Verify agent B receives and can act on the instructions
