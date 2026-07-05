@@ -5,7 +5,8 @@
 # Responsibilities:
 # - Check global registry for messages targeting current project
 # - Output unread handoff file contents with source metadata
-# - Mark delivered messages as read
+# - Mark delivered messages as read (only those successfully printed)
+# - Skip messages whose handoff file is missing (leave unread, warn)
 # - Exit 0 always (never block prompts)
 
 set -uo pipefail
@@ -66,30 +67,79 @@ fi
 # No messages file = nothing to deliver
 [ -f "$MESSAGES_FILE" ] || exit 0
 
-# Check for unread messages for this project
-unread_count="$(jq --arg p "$PROJECT_DIR" \
-  '[.[$p] // [] | .[] | select(.status == "unread")] | length' \
-  "$MESSAGES_FILE" 2>/dev/null)" || exit 0
+# ---- minimal mkdir-based lock (no dependency on txlit CLI) ----
+_HOOK_LOCK_DIR="${CONFIG_DIR}/.messages.lock"
 
-[ "$unread_count" = "0" ] && exit 0
+_hook_lock_acquire() {
+    local deadline=$(( $(date +%s) + 5 ))
+    while ! mkdir "$_HOOK_LOCK_DIR" 2>/dev/null; do
+        local now
+        now="$(date +%s)"
+        if [ "$now" -ge "$deadline" ]; then
+            return 1
+        fi
+        local lock_mtime
+        lock_mtime="$(stat -f '%m' "$_HOOK_LOCK_DIR" 2>/dev/null || echo 0)"
+        if [ "$now" -ge $(( lock_mtime + 5 )) ]; then
+            rmdir "$_HOOK_LOCK_DIR" 2>/dev/null || true
+        fi
+        sleep 0.1
+    done
+    return 0
+}
 
-# Deliver each unread message
-jq -r --arg p "$PROJECT_DIR" \
-  '.[$p] // [] | .[] | select(.status == "unread") | "\(.from)\t\(.timestamp)\t\(.handoff)"' \
-  "$MESSAGES_FILE" 2>/dev/null | while IFS=$'\t' read -r from timestamp handoff; do
-    echo "--- txlit message from ${from} [${timestamp}] ---"
-    if [ -f "$handoff" ]; then
-        cat "$handoff"
-    else
-        echo "[handoff file not found: ${handoff}]"
+_hook_lock_release() {
+    rmdir "$_HOOK_LOCK_DIR" 2>/dev/null || true
+}
+# ---------------------------------------------------------------
+
+# Acquire lock before reading; if we can't, skip delivery this prompt
+# (messages remain unread and will be delivered next prompt).
+if ! _hook_lock_acquire; then
+    echo "txlit: warning: could not acquire lock — delivery deferred to next prompt" >&2
+    exit 0
+fi
+
+# Read messages.json once and capture everything we need atomically
+unread_data="$(jq -r --arg p "$PROJECT_DIR" \
+  '.[$p] // [] | .[] | select(.status == "unread") | "\(.id)\t\(.from)\t\(.timestamp)\t\(.handoff)"' \
+  "$MESSAGES_FILE" 2>/dev/null)" || { _hook_lock_release; exit 0; }
+
+if [ -z "$unread_data" ]; then
+    _hook_lock_release
+    exit 0
+fi
+
+# Deliver each unread message; collect IDs of successfully delivered ones
+delivered_ids=""
+
+while IFS=$'\t' read -r msg_id from timestamp handoff; do
+    [ -z "$msg_id" ] && continue
+    if [ ! -f "$handoff" ]; then
+        echo "txlit: warning: handoff file missing for message ${msg_id} — leaving unread: ${handoff}" >&2
+        continue
     fi
+    echo "--- txlit message from ${from} [${timestamp}] ---"
+    cat "$handoff"
     echo "--- end txlit message ---"
     echo ""
-done
+    delivered_ids="${delivered_ids} ${msg_id} "
+done <<EOF
+$unread_data
+EOF
 
-# Mark all as read for this project (atomic write)
-jq --arg p "$PROJECT_DIR" \
-  'if .[$p] then .[$p] |= map(if .status == "unread" then .status = "read" else . end) else . end' \
-  "$MESSAGES_FILE" > "${MESSAGES_FILE}.tmp" 2>/dev/null && mv "${MESSAGES_FILE}.tmp" "$MESSAGES_FILE"
+# Mark exactly the delivered IDs as read (skip undelivered/missing ones)
+if [ -n "$delivered_ids" ]; then
+    jq --arg p "$PROJECT_DIR" --arg ids "$delivered_ids" \
+      '.[$p] = ((.[$p] // []) | map(
+         if .status == "unread" and (($ids | contains(" " + .id + " "))) then
+           .status = "read"
+         else . end
+       ))' \
+      "$MESSAGES_FILE" > "${MESSAGES_FILE}.tmp" 2>/dev/null \
+    && mv "${MESSAGES_FILE}.tmp" "$MESSAGES_FILE"
+fi
+
+_hook_lock_release
 
 exit 0

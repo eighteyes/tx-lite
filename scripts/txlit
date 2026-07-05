@@ -3,14 +3,14 @@
 # Mailbox system: register message pointers, hook delivers on prompt submit
 #
 # Responsibilities:
-# - init: one-time global setup (config dir, hook, settings.json, CLAUDE.md)
+# - compose: write + register a message (-m inline or stdin)
 # - send: register a handoff file pointer in the global registry
-# - grab: pull terminal output from kitty into current session (stdout)
-# - relay: grab terminal output from kitty and send as a message
+# - term grab: pull terminal output from kitty into current session (stdout)
+# - term relay: grab terminal output from kitty and send as a message
 # - list: display pending messages
 # - clear: remove messages from registry
-# - install: init + symlink to PATH
-# - uninstall: remove hook, config, symlink, CLAUDE.md section
+# - publish: append a JSON-line to <target>'s channel file (fire-and-forget pub/sub)
+# - listen: truncate then tail current project's channel file (Monitor-friendly stream)
 # - help: progressive-reveal usage for agents
 
 set -euo pipefail
@@ -18,35 +18,54 @@ set -euo pipefail
 CONFIG_DIR="${HOME}/.config/txlit"
 MESSAGES_FILE="${CONFIG_DIR}/messages.json"
 REGISTRY_FILE="${CONFIG_DIR}/registry.json"
-CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
-CLAUDE_MD="${HOME}/.claude/CLAUDE.md"
 MSGS_DIR="${CONFIG_DIR}/msgs"
-INSTALL_DIR="${HOME}/.local/bin"
+CHANNELS_DIR="${CONFIG_DIR}/channels"
 
-# Resolve script location (follows one level of symlink)
-get_script_dir() {
-    local source="$0"
-    local dir
-    dir="$(cd "$(dirname "$source")" && pwd)"
-    if [ -L "$source" ]; then
-        local link
-        link="$(readlink "$source")"
-        case "$link" in
-            /*) dir="$(dirname "$link")" ;;
-            *)  dir="$(cd "$dir" && cd "$(dirname "$link")" && pwd)" ;;
-        esac
-    fi
-    echo "$dir"
-}
-
-SCRIPT_DIR="$(get_script_dir)"
-HOOK_SOURCE="${SCRIPT_DIR}/../hooks/hook.sh"
-
-# Atomic JSON write: stdin → file
+# Atomic JSON write: stdin → file (refuses to clobber with empty/invalid JSON)
 json_write() {
     local file="$1"
     local tmpfile="${file}.tmp.$$"
-    cat > "$tmpfile" && mv "$tmpfile" "$file"
+    cat > "$tmpfile"
+    if [ ! -s "$tmpfile" ] || ! jq empty "$tmpfile" 2>/dev/null; then
+        rm -f "$tmpfile"
+        echo "Error: json_write refused to write empty/invalid JSON to ${file}" >&2
+        return 1
+    fi
+    mv "$tmpfile" "$file"
+}
+
+# mkdir-based advisory lock for messages.json
+# Usage: messages_lock_acquire  /  messages_lock_release
+# Retries for up to ~5 seconds; breaks stale lock after 5s by mtime.
+# On failure: prints warning to stderr and returns 1.
+_MESSAGES_LOCK_DIR="${CONFIG_DIR}/.messages.lock"
+
+messages_lock_acquire() {
+    local deadline=$(( $(date +%s) + 5 ))
+    while ! mkdir "$_MESSAGES_LOCK_DIR" 2>/dev/null; do
+        local now
+        now="$(date +%s)"
+        if [ "$now" -ge "$deadline" ]; then
+            echo "txlit: warning: could not acquire messages.json lock after 5s" >&2
+            return 1
+        fi
+        # Break stale lock: if lock dir mtime is >5s old, remove and retry
+        local lock_mtime
+        lock_mtime="$(stat -f '%m' "$_MESSAGES_LOCK_DIR" 2>/dev/null || echo 0)"
+        if [ "$now" -ge $(( lock_mtime + 5 )) ]; then
+            rmdir "$_MESSAGES_LOCK_DIR" 2>/dev/null || true
+        fi
+        sleep 0.1
+    done
+    # Ensure lock is released on unexpected exit
+    trap 'messages_lock_release' EXIT
+    return 0
+}
+
+messages_lock_release() {
+    rmdir "$_MESSAGES_LOCK_DIR" 2>/dev/null || true
+    # Remove the trap we set in acquire (restore to no-op)
+    trap - EXIT
 }
 
 # Resolve a target: registered name → path, or pass through as path
@@ -66,85 +85,78 @@ resolve_target() {
 
 # Resolve a target path to a namespace for central message storage
 # Checks registry for a name mapping to this path, falls back to basename
+# Detect if a recipient namespace has a live `txlit listen` process
+# Echoes "true" or "false"; cleans up stale pidfiles
+listener_active() {
+    local ns="$1"
+    local pidfile="${CHANNELS_DIR}/${ns}.pid"
+    if [ -f "$pidfile" ]; then
+        local lpid
+        lpid="$(cat "$pidfile" 2>/dev/null)"
+        if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then
+            echo "true"; return
+        fi
+        rm -f "$pidfile"
+    fi
+    echo "false"
+}
+
+# Dual-write a message: queue (messages.json) + live channel (channels/<ns>.jsonl)
+# Args: target_path msg_id from_path handoff_path timestamp namespace
+# Reads body from handoff_path. Stamps queue read if listener is live.
+dual_write_message() {
+    local target_path="$1" msg_id="$2" from_path="$3" handoff_path="$4" timestamp="$5" namespace="$6"
+
+    local live status
+    live="$(listener_active "$namespace")"
+    status="unread"; [ "$live" = "true" ] && status="read"
+
+    messages_lock_acquire || return 1
+    jq --arg target "$target_path" \
+       --arg id "$msg_id" \
+       --arg from "$from_path" \
+       --arg handoff "$handoff_path" \
+       --arg ts "$timestamp" \
+       --arg status "$status" \
+       '.[$target] //= [] | .[$target] += [{"id":$id,"from":$from,"handoff":$handoff,"timestamp":$ts,"status":$status}]' \
+       "$MESSAGES_FILE" | json_write "$MESSAGES_FILE"
+    messages_lock_release
+
+    mkdir -p "$CHANNELS_DIR"
+    local channel_file="${CHANNELS_DIR}/${namespace}.jsonl"
+    local from_ns
+    from_ns="$(resolve_namespace "$(cd "$from_path" 2>/dev/null && pwd || echo "$from_path")")"
+    local body
+    body="$(cat "$handoff_path" 2>/dev/null || echo "")"
+    jq -cn \
+        --arg id "$msg_id" \
+        --arg from "$from_ns" \
+        --arg ts "$timestamp" \
+        --arg handoff "$handoff_path" \
+        --arg body "$body" \
+        '{id:$id, from:$from, ts:$ts, handoff:$handoff, body:$body}' \
+        >> "$channel_file"
+
+    # Echo status for caller diagnostics
+    echo "$status"
+}
+
 resolve_namespace() {
     local target_path="$1"
     if [ -f "$REGISTRY_FILE" ]; then
         local name
+        # Prefer non-dash-prefixed names when multiple entries point at the same path
         name="$(jq -r --arg p "$target_path" \
-          'to_entries[] | select((.value | if type == "object" then .path else . end) == $p) | .key' \
-          "$REGISTRY_FILE" 2>/dev/null | head -1)"
+          '[to_entries[] | select((.value | if type == "object" then .path else . end) == $p) | .key]
+           | (map(select(startswith("-") | not)) + map(select(startswith("-"))))
+           | .[0] // empty' \
+          "$REGISTRY_FILE" 2>/dev/null)"
         if [ -n "$name" ]; then
             echo "$name"
             return
         fi
     fi
     basename "$target_path"
-}
-
-# --- init -----------------------------------------------------------
-cmd_init() {
-    echo "Initializing txlit..."
-    echo ""
-
-    # Config directory + central message store
-    mkdir -p "$CONFIG_DIR"
-    mkdir -p "$MSGS_DIR"
-    echo "  [ok] Config directory: ${CONFIG_DIR}"
-
-    # Messages registry
-    if [ ! -f "$MESSAGES_FILE" ]; then
-        echo '{}' > "$MESSAGES_FILE"
-        echo "  [ok] Created messages registry"
-    else
-        echo "  [--] Messages registry exists"
-    fi
-
-    # Name registry
-    if [ ! -f "$REGISTRY_FILE" ]; then
-        echo '{}' > "$REGISTRY_FILE"
-        echo "  [ok] Created name registry"
-    else
-        echo "  [--] Name registry exists"
-    fi
-
-    # Install hook script
-    if [ -f "$HOOK_SOURCE" ]; then
-        cp "$HOOK_SOURCE" "${CONFIG_DIR}/hook.sh"
-        chmod +x "${CONFIG_DIR}/hook.sh"
-        echo "  [ok] Installed hook script"
-    else
-        echo "  [!!] Hook source not found at ${HOOK_SOURCE}" >&2
-        echo "       Copy lib/hook.sh to ${CONFIG_DIR}/hook.sh manually." >&2
-    fi
-
-    # Register hook in global settings.json
-    if [ ! -f "$CLAUDE_SETTINGS" ]; then
-        mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
-        printf '%s\n' '{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$HOME/.config/txlit/hook.sh","timeout":10}]}]}}' \
-            | jq '.' > "$CLAUDE_SETTINGS"
-        echo "  [ok] Created ${CLAUDE_SETTINGS} with hook"
-    elif jq -e '.hooks.UserPromptSubmit // [] | map(select(.hooks[]?.command | test("txlit"))) | length > 0' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
-        echo "  [--] Hook already registered in settings"
-    else
-        jq '.hooks //= {} | .hooks.UserPromptSubmit //= [] | .hooks.UserPromptSubmit += [{"hooks":[{"type":"command","command":"$HOME/.config/txlit/hook.sh","timeout":10}]}]' \
-            "$CLAUDE_SETTINGS" | json_write "$CLAUDE_SETTINGS"
-        echo "  [ok] Added hook to ${CLAUDE_SETTINGS}"
-    fi
-
-    # Add instructions to global CLAUDE.md
-    if [ -f "$CLAUDE_MD" ]; then
-        if grep -q "txlit" "$CLAUDE_MD" 2>/dev/null; then
-            echo "  [--] CLAUDE.md already has txlit instructions"
-        else
-            printf '\n## Inter-Agent Messaging\nThis machine uses txlit for inter-agent messaging. Use `txlit compose <target> <file> <<EOF` to send messages across projects. All messages stored centrally in ~/.config/txlit/msgs/ (sandbox-safe). Run `txlit who` for targets, `txlit -h` for full usage.\n' >> "$CLAUDE_MD"
-            echo "  [ok] Added txlit section to CLAUDE.md"
-        fi
-    else
-        echo "  [!!] No CLAUDE.md found at ${CLAUDE_MD}"
-    fi
-
-    echo ""
-    echo "Done. Run 'txlit -h' for usage."
 }
 
 # --- inbox ----------------------------------------------------------
@@ -184,13 +196,22 @@ cmd_inbox() {
 # --- compose --------------------------------------------------------
 cmd_compose() {
     local deliver=false
+    local tmux_name=""
+    local async_mode=""
+    local timeout_sec=""
     local target=""
     local filename=""
+    local inline_msg=""
 
     # Parse flags
     while [ $# -gt 0 ]; do
         case "$1" in
             --deliver) deliver=true; shift ;;
+            --tmux) tmux_name="$2"; shift 2 ;;
+            --async-background) async_mode="single"; shift ;;
+            --async-background-monitor) async_mode="monitor"; shift ;;
+            --timeout) timeout_sec="$2"; shift 2 ;;
+            -m|--message) inline_msg="$2"; shift 2 ;;
             -*) echo "Unknown flag: $1" >&2; exit 1 ;;
             *)
                 if [ -z "$target" ]; then target="$1"
@@ -200,19 +221,47 @@ cmd_compose() {
         esac
     done
 
-    if [ -z "$target" ] || [ -z "$filename" ]; then
-        echo "Usage: txlit compose [--deliver] <target|name> <filename>" >&2
-        echo "  Reads message body from stdin, writes file, registers message." >&2
+    # Validate flag combinations
+    if [ -n "$async_mode" ] && [ "$deliver" = true ]; then
+        echo "Error: --async-background[-monitor] is mutually exclusive with --deliver" >&2
+        exit 1
+    fi
+    if [ -n "$tmux_name" ] && [ "$deliver" = true ]; then
+        echo "Error: --tmux is mutually exclusive with --deliver" >&2
+        exit 1
+    fi
+
+    # Auto-generate filename when not explicitly given
+    if [ -z "$filename" ]; then
+        local date_prefix
+        date_prefix="$(date +"%Y-%m-%d")"
+        local short_hash
+        short_hash="$(uuidgen | tr '[:upper:]' '[:lower:]' | cut -c1-6)"
+        filename="${date_prefix}-${short_hash}.md"
+    fi
+
+    if [ -z "$target" ]; then
+        echo "Usage: txlit compose [--deliver] [-m <message>] <target|name> [filename]" >&2
+        echo "  Writes file and registers message. Filename auto-generated when omitted." >&2
         echo "" >&2
-        echo "  --deliver  Launch a new kitty pane and feed the message to claude" >&2
-        echo "  target     Path or registered name (see: txlit who)" >&2
-        echo "  filename   Name for the handoff file (e.g., 2026-03-11-bug-report.md)" >&2
+        echo "  --deliver      Launch a new kitty pane and feed the message to claude" >&2
+        echo "  -m, --message  Inline message body" >&2
+        echo "  target         Path or registered name (see: txlit who)" >&2
+        echo "  filename       Name for handoff file (optional; auto-generated as YYYY-MM-DD-xxxxxx.md)" >&2
         echo "" >&2
-        echo "Example:" >&2
-        echo "  txlit compose --deliver backend 2026-03-11-auth-bug.md <<'EOF'" >&2
-        echo "  # Auth token expiring early" >&2
-        echo "  JWT tokens expire after 5 min instead of 60." >&2
+        echo "Body input (three styles):" >&2
+        echo "  -m flag        Inline one-liner" >&2
+        echo "  stdin          Heredoc or pipe (multi-line content)" >&2
+        echo "  interactive    No -m, no pipe → drops into \$EDITOR with a seeded template" >&2
+        echo "" >&2
+        echo "Examples:" >&2
+        echo "  txlit compose backend -m 'JWT tokens expire after 5 min'" >&2
+        echo "  echo 'body' | txlit compose backend" >&2
+        echo "  txlit compose backend <<'EOF'" >&2
+        echo "  multi-line" >&2
+        echo "  body here" >&2
         echo "  EOF" >&2
+        echo "  txlit compose backend                # interactive editor" >&2
         exit 1
     fi
 
@@ -232,20 +281,43 @@ cmd_compose() {
     local msgs_dir="${MSGS_DIR}/${namespace}"
     mkdir -p "$msgs_dir"
 
-    # Write stdin to handoff file in central store
+    # Write message body to handoff file in central store
     local handoff_path="${msgs_dir}/${filename}"
-    cat > "$handoff_path"
+    if [ -n "$inline_msg" ]; then
+        printf '%s\n' "$inline_msg" > "$handoff_path"
+    elif [ -t 0 ]; then
+        # Interactive: drop into $EDITOR (fallback nano/vi) with a seeded template
+        local editor="${VISUAL:-${EDITOR:-}}"
+        if [ -z "$editor" ]; then
+            if command -v nano >/dev/null 2>&1; then editor=nano
+            else editor=vi
+            fi
+        fi
+        {
+            echo "# txlit message to ${target_path}"
+            echo "# Lines starting with # are stripped. Save & quit to send; empty body aborts."
+            echo ""
+        } > "$handoff_path"
+        "$editor" "$handoff_path"
+        # Strip comment lines
+        grep -v '^#' "$handoff_path" > "${handoff_path}.tmp" && mv "${handoff_path}.tmp" "$handoff_path"
+    else
+        cat > "$handoff_path"
+    fi
 
     if [ ! -s "$handoff_path" ]; then
         rm -f "$handoff_path"
-        echo "Error: empty message body (nothing on stdin)" >&2
+        echo "Error: empty message body (use -m flag or pipe via stdin)" >&2
         exit 1
     fi
 
-    # Ensure initialized
+    # Ensure initialized + recover from empty/corrupt registry
     if [ ! -f "$MESSAGES_FILE" ]; then
-        echo "Error: txlit not initialized. Run 'txlit init' first." >&2
+        echo "Error: txlit not initialized. Is the plugin enabled?" >&2
         exit 1
+    fi
+    if [ ! -s "$MESSAGES_FILE" ] || ! jq empty "$MESSAGES_FILE" 2>/dev/null; then
+        echo '{}' > "$MESSAGES_FILE"
     fi
 
     # Generate message ID
@@ -254,23 +326,31 @@ cmd_compose() {
 
     # Sender = current project or working directory
     local from_path="${CLAUDE_PROJECT_DIR:-$PWD}"
+    from_path="$(cd "$from_path" 2>/dev/null && pwd)" || from_path="${CLAUDE_PROJECT_DIR:-$PWD}"
+
+    # For async-background modes: capture inbox cursor BEFORE registry write
+    # so any reply arriving after this point gets picked up by the wait loop.
+    local async_cursor=0
+    if [ -n "$async_mode" ]; then
+        async_cursor="$(jq --arg p "$from_path" '(.[$p] // []) | length' "$MESSAGES_FILE" 2>/dev/null || echo 0)"
+    fi
 
     # Timestamp
     local timestamp
     timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-    # Append to registry (atomic write)
-    jq --arg target "$target_path" \
-       --arg id "$msg_id" \
-       --arg from "$from_path" \
-       --arg handoff "$handoff_path" \
-       --arg ts "$timestamp" \
-       '.[$target] //= [] | .[$target] += [{"id":$id,"from":$from,"handoff":$handoff,"timestamp":$ts,"status":"unread"}]' \
-       "$MESSAGES_FILE" | json_write "$MESSAGES_FILE"
+    # Dual-write: queue + live channel (one path; status auto-set if listener is live)
+    local _compose_status
+    _compose_status="$(dual_write_message "$target_path" "$msg_id" "$from_path" "$handoff_path" "$timestamp" "$namespace")"
 
-    echo "Composed and registered message ${msg_id}"
-    echo "  to:      ${target_path}"
-    echo "  file:    ${filename}"
+    # In async modes, stdout is reserved for reply body / JSON records.
+    local _out
+    if [ -n "$async_mode" ]; then _out=2; else _out=1; fi
+    {
+        echo "Composed and registered message ${msg_id}"
+        echo "  to:      ${target_path}"
+        echo "  file:    ${filename}"
+    } >&${_out}
 
     # Deliver: launch kitty pane alongside existing claudes, start claude with file
     if [ "$deliver" = true ]; then
@@ -305,18 +385,171 @@ cmd_compose() {
 
         echo "  deliver: pane ${pane_id} launched at ${target_path}"
     fi
+
+    # --tmux <name>: start (or attach) a tmux session in the target's cwd
+    # running `cat " " | claude`. The single-space stdin gives claude a
+    # prompt submission, firing UserPromptSubmit → the txlit hook delivers
+    # this just-registered message.
+    if [ -n "$tmux_name" ]; then
+        if ! command -v tmux >/dev/null 2>&1; then
+            echo "  [!!] --tmux requires tmux on PATH" >&2
+        else
+            local _tmux_out=1
+            [ -n "$async_mode" ] && _tmux_out=2
+            echo "  tmux:    starting session '${tmux_name}' at ${target_path}" >&${_tmux_out}
+            tmux new-session -A -s "$tmux_name" -c "$target_path" "echo ' ' | claude"
+        fi
+    fi
+
+    # Async background modes: send compose to stderr (so stdout stays clean
+    # for reply body) then enter the wait loop.
+    if [ -n "$async_mode" ]; then
+        _asyncbg_wait_loop "$from_path" "$target_path" "$async_cursor" "$async_mode" "$timeout_sec"
+    fi
+}
+
+# --- async-background wait loop -------------------------------------
+# Polls messages.json for new entries to $inbox_path from $target_path
+# at indices >= $cursor. Marks consumed entries as read.
+#
+# mode = "single"   → exit 0 on first reply, write body to stdout
+# mode = "monitor"  → emit JSON-line per reply, loop until timeout/signal
+_asyncbg_wait_loop() {
+    local inbox_path="$1"
+    local target_path="$2"
+    local cursor="$3"
+    local mode="$4"
+    local timeout_sec="$5"
+
+    # Default timeouts: 600s for single, 0 (infinite) for monitor
+    if [ -z "$timeout_sec" ]; then
+        if [ "$mode" = "single" ]; then timeout_sec=600
+        else timeout_sec=0
+        fi
+    fi
+
+    # In monitor mode, exit cleanly on SIGTERM/SIGINT
+    trap 'exit 0' TERM INT
+
+    # Move compose stdout banner out of the way — body output goes to stdout
+    # from here on. (echoes already happened above; from now on we write to
+    # stdout only for replies.)
+
+    local start_epoch
+    start_epoch="$(date +%s)"
+    local poll_interval="0.5"
+
+    # Track consumed message IDs (space-delimited) to avoid double-emit
+    # if a hook concurrently flips status to read.
+    local seen_ids=" "
+
+    while :; do
+        # Timeout check
+        if [ "$timeout_sec" -gt 0 ]; then
+            local now_epoch
+            now_epoch="$(date +%s)"
+            if [ $((now_epoch - start_epoch)) -ge "$timeout_sec" ]; then
+                exit 124
+            fi
+        fi
+
+        # Query new entries from target at or after cursor that we haven't seen
+        if [ -s "$MESSAGES_FILE" ] && jq empty "$MESSAGES_FILE" 2>/dev/null; then
+            local new_entries
+            new_entries="$(jq -r --arg p "$inbox_path" \
+                                  --arg t "$target_path" \
+                                  --argjson c "$cursor" \
+                '(.[$p] // [])[$c:]
+                 | map(select(.from == $t))
+                 | .[]
+                 | [.id, .handoff, .timestamp] | @tsv' \
+                "$MESSAGES_FILE" 2>/dev/null)"
+
+            if [ -n "$new_entries" ]; then
+                while IFS=$'\t' read -r msg_id handoff ts; do
+                    [ -z "$msg_id" ] && continue
+                    case "$seen_ids" in
+                        *" $msg_id "*) continue ;;
+                    esac
+                    seen_ids="${seen_ids}${msg_id} "
+
+                    local body=""
+                    if [ -f "$handoff" ]; then
+                        body="$(cat "$handoff")"
+                    fi
+
+                    # Atomically mark this message read
+                    if [ -s "$MESSAGES_FILE" ] && jq empty "$MESSAGES_FILE" 2>/dev/null; then
+                        if messages_lock_acquire 2>/dev/null; then
+                            jq --arg p "$inbox_path" --arg id "$msg_id" \
+                               '.[$p] = ((.[$p] // []) | map(if .id == $id then .status = "read" else . end))' \
+                               "$MESSAGES_FILE" | json_write "$MESSAGES_FILE" 2>/dev/null || true
+                            messages_lock_release
+                        fi
+                    fi
+
+                    if [ "$mode" = "single" ]; then
+                        printf '%s\n' "$body"
+                        exit 0
+                    else
+                        # Monitor: emit single-line JSON record (jq escapes for us)
+                        jq -cn --arg id "$msg_id" \
+                               --arg from "$target_path" \
+                               --arg ts "$ts" \
+                               --arg body "$body" \
+                               '{id:$id, from:$from, ts:$ts, body:$body}'
+                    fi
+                done <<EOF
+$new_entries
+EOF
+            fi
+        fi
+
+        sleep "$poll_interval"
+    done
 }
 
 # --- send -----------------------------------------------------------
 cmd_send() {
-    local target_path="${1:-}"
-    local handoff_file="${2:-}"
+    local target_path="" handoff_file="" inline_body=""
 
-    if [ -z "$target_path" ] || [ -z "$handoff_file" ]; then
-        echo "Usage: txlit send <target|name> <handoff-file>" >&2
-        echo "" >&2
-        echo "  target   Path or registered name (see: txlit who)" >&2
-        echo "  handoff  Filename in ~/.config/txlit/msgs/<namespace>/" >&2
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -m) inline_body="$2"; shift 2 ;;
+            -h|--help)
+                cat <<'SENDHELP' >&2
+Usage:
+  txlit send <target> <handoff-file>      # send pre-written file in msgs dir
+  txlit send <target> -m "<body>"         # send inline body (auto-creates file)
+  cat body.md | txlit send <target> -m -  # body from stdin
+
+Writes to BOTH messages.json (queue, hook-delivered on recipient's next prompt)
+AND channels/<target>.jsonl (live stream, picked up by `txlit listen` via Monitor).
+If recipient is currently listening, queue entry is marked read on write so the
+hook does not double-deliver.
+SENDHELP
+                return 0 ;;
+            *)
+                if [ -z "$target_path" ]; then target_path="$1"
+                elif [ -z "$handoff_file" ]; then handoff_file="$1"
+                else echo "Unexpected arg: $1" >&2; exit 1
+                fi
+                shift ;;
+        esac
+    done
+
+    if [ -z "$target_path" ]; then
+        echo "Usage: txlit send <target> {<handoff-file> | -m '<body>'}" >&2
+        exit 1
+    fi
+
+    # Inline body: read stdin if -m -, else use the literal arg
+    if [ -n "$inline_body" ]; then
+        if [ "$inline_body" = "-" ]; then
+            inline_body="$(cat)"
+        fi
+    elif [ -z "$handoff_file" ]; then
+        echo "Error: provide either a handoff file or -m '<body>'." >&2
         exit 1
     fi
 
@@ -329,13 +562,26 @@ cmd_send() {
         exit 1
     }
 
-    # Check handoff file in central store
+    # Resolve namespace and msgs dir
     local namespace
     namespace="$(resolve_namespace "$target_path")"
-    local handoff_path="${MSGS_DIR}/${namespace}/${handoff_file}"
-    if [ ! -f "$handoff_path" ]; then
-        echo "Error: handoff file not found: ${handoff_path}" >&2
-        exit 1
+    mkdir -p "${MSGS_DIR}/${namespace}"
+
+    local handoff_path
+    if [ -n "$inline_body" ]; then
+        # Auto-create handoff file from inline body
+        local ts_short sender_ns
+        ts_short="$(date -u +"%Y%m%dT%H%M%SZ")"
+        sender_ns="$(resolve_namespace "$(cd "${CLAUDE_PROJECT_DIR:-$PWD}" 2>/dev/null && pwd || echo "$PWD")")"
+        handoff_file="${ts_short}-${sender_ns}--${namespace}-$(uuidgen | tr '[:upper:]' '[:lower:]' | cut -c1-6).md"
+        handoff_path="${MSGS_DIR}/${namespace}/${handoff_file}"
+        printf '%s\n' "$inline_body" > "$handoff_path"
+    else
+        handoff_path="${MSGS_DIR}/${namespace}/${handoff_file}"
+        if [ ! -f "$handoff_path" ]; then
+            echo "Error: handoff file not found: ${handoff_path}" >&2
+            exit 1
+        fi
     fi
 
     # Clean front matter: agents in tx sessions may write tx/core instead of core/core
@@ -346,10 +592,13 @@ cmd_send() {
         fi
     fi
 
-    # Ensure initialized
+    # Ensure initialized + recover from empty/corrupt registry
     if [ ! -f "$MESSAGES_FILE" ]; then
-        echo "Error: txlit not initialized. Run 'txlit init' first." >&2
+        echo "Error: txlit not initialized. Is the plugin enabled?" >&2
         exit 1
+    fi
+    if [ ! -s "$MESSAGES_FILE" ] || ! jq empty "$MESSAGES_FILE" 2>/dev/null; then
+        echo '{}' > "$MESSAGES_FILE"
     fi
 
     # Generate message ID
@@ -363,17 +612,10 @@ cmd_send() {
     local timestamp
     timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-    # Append to registry (atomic write)
-    jq --arg target "$target_path" \
-       --arg id "$msg_id" \
-       --arg from "$from_path" \
-       --arg handoff "$handoff_path" \
-       --arg ts "$timestamp" \
-       '.[$target] //= [] | .[$target] += [{"id":$id,"from":$from,"handoff":$handoff,"timestamp":$ts,"status":"unread"}]' \
-       "$MESSAGES_FILE" | json_write "$MESSAGES_FILE"
+    local queue_status
+    queue_status="$(dual_write_message "$target_path" "$msg_id" "$from_path" "$handoff_path" "$timestamp" "$namespace")"
 
-    echo "Registered message ${msg_id}"
-    echo "  to:      ${target_path}"
+    echo "Sent ${msg_id} → ${namespace} (queue=${queue_status})"
     echo "  handoff: ${handoff_file}"
 }
 
@@ -439,13 +681,17 @@ cmd_clear() {
 
     if [ -n "$msg_id" ]; then
         # Remove specific message
+        messages_lock_acquire || { echo "Error: could not lock messages.json" >&2; exit 1; }
         jq --arg p "$clear_path" --arg id "$msg_id" \
           'if .[$p] then .[$p] |= map(select(.id != $id)) | if .[$p] | length == 0 then del(.[$p]) else . end else . end' \
           "$MESSAGES_FILE" | json_write "$MESSAGES_FILE"
+        messages_lock_release
         echo "Cleared message ${msg_id} from ${clear_path}"
     else
         # Remove all for path
+        messages_lock_acquire || { echo "Error: could not lock messages.json" >&2; exit 1; }
         jq --arg p "$clear_path" 'del(.[$p])' "$MESSAGES_FILE" | json_write "$MESSAGES_FILE"
+        messages_lock_release
         echo "Cleared all messages for ${clear_path}"
     fi
 }
@@ -464,6 +710,14 @@ cmd_register() {
         echo "  intent   What this project is about" >&2
         exit 1
     fi
+
+    # Reject dash-prefixed names — they collide with CLI flags and poison resolve_namespace
+    case "$name" in
+        -*)
+            echo "Error: name cannot start with '-' (looks like a flag): '${name}'" >&2
+            echo "Hint: if you meant to pass a flag, run 'txlit register --help'." >&2
+            exit 1 ;;
+    esac
 
     # Resolve to absolute path
     reg_path="$(cd "$reg_path" 2>/dev/null && pwd)" || {
@@ -488,6 +742,79 @@ cmd_register() {
           "$REGISTRY_FILE" | json_write "$REGISTRY_FILE"
         echo "Registered '${name}' → ${reg_path}"
     fi
+}
+
+# --- start ----------------------------------------------------------
+# Spin up (or attach) a tmux session for a registered project. Used to bring
+# projects back online after a reboot — every session is named verbatim after
+# its registered name so `voice-to-ass`'s retarget macro can find it directly.
+cmd_start() {
+    local name=""
+    local resume=false
+    local cmd_to_run="claude"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -r|--resume) resume=true; shift ;;
+            --cmd) cmd_to_run="$2"; shift 2 ;;
+            -h|--help)
+                cat <<'STARTHELP'
+txlit start <name> [--resume] [--cmd <command>]
+
+Create (or attach to) a tmux session named <name>, running <command> in the
+project's registered directory. Idempotent — if the session already exists,
+prints the attach command and exits.
+
+  --resume       Pass --resume to the default `claude` command
+  --cmd <cmd>    Run a different command instead of `claude`
+STARTHELP
+                return 0 ;;
+            -*) echo "Unknown flag: $1" >&2; return 1 ;;
+            *)
+                if [ -z "$name" ]; then name="$1"; else echo "Unexpected arg: $1" >&2; return 1; fi
+                shift ;;
+        esac
+    done
+
+    if [ -z "$name" ]; then
+        echo "Usage: txlit start <name> [--resume] [--cmd <command>]" >&2
+        return 1
+    fi
+    if ! command -v tmux >/dev/null 2>&1; then
+        echo "Error: tmux not found on PATH" >&2
+        return 1
+    fi
+
+    # Resolve registered name → repo path. Fail loudly if unregistered, so
+    # the user doesn't accidentally start sessions in random cwds.
+    local path
+    path="$(resolve_target "$name")"
+    if [ "$path" = "$name" ] || [ ! -d "$path" ]; then
+        echo "Error: '${name}' is not a registered project (run 'txlit register ${name}' first)" >&2
+        return 1
+    fi
+    path="$(cd "$path" 2>/dev/null && pwd)" || {
+        echo "Error: registered path does not exist: $path" >&2
+        return 1
+    }
+
+    # Idempotent attach — if the session is already alive, don't relaunch it.
+    if tmux has-session -t "=${name}" 2>/dev/null; then
+        echo "Session '${name}' already running."
+        echo "  attach: tmux attach -t =${name}"
+        return 0
+    fi
+
+    # --resume is a sugar flag for the default `claude` command only; if the
+    # user overrode --cmd, we hand off responsibility for resume semantics.
+    local inner="$cmd_to_run"
+    if [ "$resume" = true ] && [ "$cmd_to_run" = "claude" ]; then
+        inner="claude --resume"
+    fi
+
+    tmux new-session -d -s "$name" -c "$path" "$inner"
+    echo "Started session '${name}' in ${path} (running: ${inner})"
+    echo "  attach: tmux attach -t =${name}"
 }
 
 # --- intent ---------------------------------------------------------
@@ -565,118 +892,25 @@ cmd_who() {
       end' "$REGISTRY_FILE"
 }
 
-# --- install --------------------------------------------------------
-cmd_install() {
-    local bin_dir="${1:-$INSTALL_DIR}"
-
-    # Resolve the real script path (not the symlink)
-    local real_script
-    real_script="${SCRIPT_DIR}/txlit"
-
-    # Run init first
-    cmd_init
-
-    echo ""
-
-    # Create bin directory
-    mkdir -p "$bin_dir"
-
-    # Symlink txlit to PATH
-    local link_path="${bin_dir}/txlit"
-    if [ -L "$link_path" ]; then
-        local existing
-        existing="$(readlink "$link_path")"
-        if [ "$existing" = "$real_script" ]; then
-            echo "  [--] Symlink already exists: ${link_path} → ${real_script}"
-        else
-            ln -sf "$real_script" "$link_path"
-            echo "  [ok] Updated symlink: ${link_path} → ${real_script}"
-        fi
-    elif [ -f "$link_path" ]; then
-        echo "  [!!] ${link_path} exists and is not a symlink. Remove it first." >&2
-    else
-        ln -s "$real_script" "$link_path"
-        echo "  [ok] Symlinked: ${link_path} → ${real_script}"
-    fi
-
-    # Check if bin_dir is in PATH
-    case ":${PATH}:" in
-        *":${bin_dir}:"*) ;;
-        *) echo "  [!!] ${bin_dir} is not in your PATH. Add it to your shell profile." >&2 ;;
-    esac
-
-    echo ""
-    echo "Installed. Run 'txlit -h' from anywhere."
-}
-
-# --- uninstall ------------------------------------------------------
-cmd_uninstall() {
-    echo "Uninstalling txlit..."
-    echo ""
-
-    # Remove symlink
-    local link_path="${INSTALL_DIR}/txlit"
-    if [ -L "$link_path" ]; then
-        rm "$link_path"
-        echo "  [ok] Removed symlink: ${link_path}"
-    else
-        echo "  [--] No symlink at ${link_path}"
-    fi
-
-    # Remove hook from settings.json
-    if [ -f "$CLAUDE_SETTINGS" ] && jq -e '.hooks.UserPromptSubmit' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
-        jq '.hooks.UserPromptSubmit |= map(select(.hooks | all(.command | test("txlit") | not))) | if .hooks.UserPromptSubmit | length == 0 then del(.hooks.UserPromptSubmit) else . end' \
-            "$CLAUDE_SETTINGS" | json_write "$CLAUDE_SETTINGS"
-        echo "  [ok] Removed hook from ${CLAUDE_SETTINGS}"
-    else
-        echo "  [--] No hook found in settings"
-    fi
-
-    # Remove txlit section from CLAUDE.md
-    if [ -f "$CLAUDE_MD" ] && grep -q "## Inter-Agent Messaging" "$CLAUDE_MD" 2>/dev/null; then
-        # Remove the section (header + following line)
-        sed '/^## Inter-Agent Messaging$/,/^$/d' "$CLAUDE_MD" > "${CLAUDE_MD}.tmp" && mv "${CLAUDE_MD}.tmp" "$CLAUDE_MD"
-        echo "  [ok] Removed txlit section from CLAUDE.md"
-    else
-        echo "  [--] No txlit section in CLAUDE.md"
-    fi
-
-    # Remove config directory
-    if [ -d "$CONFIG_DIR" ]; then
-        rm -r "$CONFIG_DIR"
-        echo "  [ok] Removed ${CONFIG_DIR}"
-    else
-        echo "  [--] No config directory at ${CONFIG_DIR}"
-    fi
-
-    echo ""
-    echo "Uninstalled. Source files remain at ${SCRIPT_DIR}/../"
-}
-
 # --- help -----------------------------------------------------------
 cmd_help() {
     cat << 'HELP'
 txlit - Inter-agent messaging for Claude Code
 
 USAGE:
-  txlit install [bin-dir]             Init + symlink to PATH (default: ~/.local/bin)
-  txlit uninstall                     Remove hook, config, symlink, CLAUDE.md section
-  txlit init                          Setup without symlink
   txlit register <name> [path] [intent] Name a project (default: current dir)
+  txlit start <name> [--resume]       Spin up (or attach) a tmux session for a project
   txlit intent <name> <intent>        Update a project's intent
   txlit unregister <name>             Remove a named project
   txlit who                           List registered names + intents
   txlit inbox                          Check messages for current project
-  txlit grab [--extent <type>] [--match <window>]
-                                     Pull terminal output from kitty into current session
-                                     extent: last_cmd_output (default), selection, screen
-  txlit compose [--deliver] <target|name> <file>
-                                     Write + register a message from stdin
+  txlit compose [--deliver] [-m <msg>] <target|name> [file]
+                                     Write + register a message
+                                     Body: -m flag, stdin pipe/heredoc, or \$EDITOR
                                      --deliver: launch kitty pane, start claude
-  txlit relay [--deliver] [--extent <type>] [--match <window>] <target> [label]
-                                     Grab kitty terminal output and send as message
-                                     extent: last_cmd_output (default), selection, screen
   txlit send <target|name> <handoff>  Register an existing handoff file
+  txlit term <command>                Terminal integration (kitty)
+                                     Run 'txlit term -h' for details
   txlit list [path|name]              Show pending messages
   txlit clear <path|name> [id]        Remove messages
   txlit help                          Show this help
@@ -694,7 +928,6 @@ WORKFLOW:
 FILES:
   ~/.config/txlit/messages.json           Global message registry
   ~/.config/txlit/registry.json           Named project aliases
-  ~/.config/txlit/hook.sh                 Hook script (installed by init)
   ~/.config/txlit/msgs/<namespace>/*.md   Handoff instruction files
 
 EXAMPLES:
@@ -703,6 +936,7 @@ EXAMPLES:
   JWT tokens expire after 5 min instead of 60.
   EOF
 
+  txlit compose backend -m 'JWT tokens expire after 5 min'
   txlit register prototypologist ~/projects/prototypologist "AI prototyping sandbox"
   txlit send prototypologist 2026-02-13-setup-auth.md
   txlit list
@@ -730,42 +964,123 @@ Shows unread and read messages for the current project.
 
 Use `txlit compose` to write and register a message in one step. Messages are stored centrally in `~/.config/txlit/msgs/` — no files are written to the target project's directory.
 
+Three input styles — filename is optional in all (auto-generated as `YYYY-MM-DD-xxxxxx.md`):
+
 ```bash
-txlit compose <target> <filename> <<'EOF'
-Your message content here.
+# 1. Inline flag (shortest, for one-liners)
+txlit compose <target> -m 'Your message here'
+
+# 2. Heredoc / pipe (preferred for multi-line AI-authored content)
+txlit compose <target> <<'EOF'
+multi-line
+body here
 EOF
+echo "body" | txlit compose <target>
+
+# 3. Interactive editor (humans at a tty with no -m and no pipe)
+txlit compose <target>   # drops into $EDITOR with a seeded template
+
+# Optional explicit filename
+txlit compose <target> custom-name.md -m 'body'
 
 # --deliver: also launch a new kitty pane and start claude with the message
-txlit compose --deliver <target> <filename> <<'EOF'
-Your message content here.
-EOF
+txlit compose --deliver <target> -m 'Your message here'
+
+# --tmux <name>: start (or attach) a tmux session in the target's cwd
+# running `echo ' ' | claude` so the UserPromptSubmit hook fires and the
+# just-registered message is delivered. The session takes over the current
+# terminal until detached.
+txlit compose --tmux session-name <target> -m 'Your message here'
 ```
+
+Detection: stdin tty → editor; stdin piped → cat; `-m` → inline (skips both).
 
 - `target`: registered project name (run `txlit who` to list)
-- `filename`: convention is `YYYY-MM-DD-description.md`
+- `filename`: convention is `YYYY-MM-DD-description.md` (auto-generated)
 
-### Example
+## Synchronous-Feeling RPC (background wait)
+
+Default txlit messaging is fire-and-forget — replies arrive via the UserPromptSubmit hook on your NEXT prompt. That's broken for agent-to-agent RPC. Use `--async-background` when you need an answer before continuing.
+
+### Single-reply RPC
 
 ```bash
-txlit compose backend 2026-03-11-auth-bug.md <<'EOF'
-# Auth tokens expire early
-
-JWT tokens expire after 5 minutes instead of the configured 60.
-Reproduction: login, wait 6 minutes, attempt API call → 401.
-
-## Suggested fix
-Check `TOKEN_EXPIRY` env var in `src/auth/jwt.ts`.
-EOF
+txlit compose --async-background <target> -m '<question>'
 ```
+
+Sends the message, then BLOCKS this process until a reply arrives in the current project's inbox from `<target>`. On reply: writes the reply body to stdout and exits 0. On `--timeout`: exits 124.
+
+INVOKE THIS VIA `Bash(run_in_background=true)`. The harness notifies you when the background process exits. Do NOT call it in the foreground — you will just sit there until reply or timeout, burning context.
+
+Pattern:
+1. `Bash(command="txlit compose --async-background <target> -m '...'", run_in_background=true)` → returns a bg id immediately
+2. Continue with other work
+3. Harness notifies when bg exits → read its stdout for the reply body
+
+### Streaming channel (back-and-forth)
+
+```bash
+txlit compose --async-background-monitor <target> -m '<opener>'
+```
+
+Same setup, but does not exit on first reply. Each subsequent reply from `<target>` is emitted as a single-line JSON record on stdout:
+
+```
+{"id":"...","from":"...","ts":"...","body":"..."}
+```
+
+INVOKE THIS VIA the `Monitor` tool — each stdout line becomes one notification. Pair with `Bash` send-calls to reply back.
+
+If BOTH agents launch monitor toward each other, the conversation lives entirely in the two stdout streams — neither agent's UserPromptSubmit hook fires for these messages. You experience it as a chat log, not as discrete file handoffs.
+
+### When to use which
+
+| Mode | Use for |
+|------|---------|
+| Default (no flag) | Fire-and-forget. Recipient sees it next prompt. Handoffs, status reports, async memos. |
+| `--async-background` | One question, one answer. Lookups, confirmations, "is X ready" pings. |
+| `--async-background-monitor` | Sustained collaboration. Two agents working together for a while. |
+
+### Flags
+
+- `--timeout <seconds>` — default 600 for asyncbg, infinite for monitor. Exit 124 on timeout.
+
+## Channels (many-to-one streaming pub/sub)
+
+For lightweight ambient updates where the recipient just wants to watch ONE file and many publishers want to push at it without blocking. No inbox entry, no hook, no reply path.
+
+```bash
+# Publisher (any project) — fire-and-forget
+txlit publish <target> -m 'build green'
+echo 'tests passing' | txlit publish <target>
+
+# Recipient — truncates own channel file, then tails it forever
+txlit listen
+```
+
+`listen` truncates `~/.config/txlit/channels/<me>.jsonl` on start (clean slate per session) then `tail -F`s it. Each appended record is emitted as one JSON line on stdout:
+
+```
+{"id":"...","from":"<sender-project>","ts":"...","body":"..."}
+```
+
+INVOKE `txlit listen` VIA the `Monitor` tool — each stdout line becomes one notification. Publishers from any registered project can append; the recipient sees them as a live stream.
+
+Differences from `--async-background-monitor`:
+- Many-to-one (channels) vs one-to-one (monitor RPC)
+- Publishers never block; no reply path
+- File is truncated on every `listen` start (no replay, no history)
 
 ## Commands
 
 | Command | Purpose |
 |---------|---------|
 | `txlit inbox` | Check messages for current project |
-| `txlit grab` | Pull kitty terminal output into current session |
-| `txlit compose <target> <file>` | Write + register message from stdin |
-| `txlit relay <target> [label]` | Grab kitty terminal output and send as message |
+| `txlit compose <target> [file]` | Write + register message (-m or stdin) |
+| `txlit publish <target>` | Append JSON-line to <target>'s channel (fire-and-forget) |
+| `txlit listen` | Truncate + tail current project's channel; one JSON-line per record (Monitor-friendly) |
+| `txlit term grab` | Pull kitty terminal output into current session |
+| `txlit term relay <target> [label]` | Grab kitty terminal output and send as message |
 | `txlit send <target> <file>` | Register a pre-written handoff file |
 | `txlit who` | List registered projects |
 | `txlit list [target]` | Show pending messages for a target |
@@ -781,15 +1096,60 @@ EOF
 AGENTHELP
 }
 
-# --- grab -----------------------------------------------------------
-cmd_grab() {
+# --- term -----------------------------------------------------------
+cmd_term_help() {
+    cat << 'TERMHELP'
+txlit term - Terminal integration (kitty)
+
+USAGE:
+  txlit term grab [--extent <type>] [--match <window>]
+  txlit term relay [--deliver] [--extent <type>] [--match <window>] <target> [label]
+  txlit term help
+
+COMMANDS:
+  grab     Pull terminal output from kitty into current session (stdout)
+  relay    Grab terminal output and send as a message to another project
+
+OPTIONS:
+  --extent <type>    What to capture (default: last_cmd_output)
+                     last_cmd_output, last_non_empty_output, screen, selection
+  --match <window>   Kitty window match expression (default: recent:1)
+  --deliver          (relay only) Launch kitty pane and start claude with message
+
+EXAMPLES:
+  txlit term grab                              # last command output to stdout
+  txlit term grab --extent selection            # selected text to stdout
+  txlit term grab --match title:server          # from specific window
+  txlit term relay backend                      # last cmd output → backend
+  txlit term relay backend build-error          # with label
+  txlit term relay --extent selection backend   # selected text → backend
+  txlit term relay --deliver backend hotfix     # send + launch claude
+
+REQUIRES:
+  kitty with allow_remote_control enabled and shell_integration active.
+TERMHELP
+}
+
+cmd_term() {
+    local subcmd="${1:-help}"
+    shift 2>/dev/null || true
+    case "$subcmd" in
+        grab)           cmd_term_grab "$@" ;;
+        relay)          cmd_term_relay "$@" ;;
+        help|-h|--help) cmd_term_help ;;
+        *)              echo "Unknown term command: $subcmd" >&2; cmd_term_help >&2; exit 1 ;;
+    esac
+}
+
+# --- term grab ------------------------------------------------------
+cmd_term_grab() {
     local extent="last_cmd_output"
     local match_arg=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --extent)  extent="$2"; shift 2 ;;
-            --match|-m) match_arg="$2"; shift 2 ;;
+            --match) match_arg="$2"; shift 2 ;;
             -*) echo "Unknown flag: $1" >&2; exit 1 ;;
             *)  echo "Unexpected argument: $1" >&2; exit 1 ;;
         esac
@@ -823,8 +1183,8 @@ cmd_grab() {
     printf '%s\n' "$captured"
 }
 
-# --- relay ----------------------------------------------------------
-cmd_relay() {
+# --- term relay -----------------------------------------------------
+cmd_term_relay() {
     local target=""
     local label=""
     local extent="last_cmd_output"
@@ -836,7 +1196,7 @@ cmd_relay() {
         case "$1" in
             --deliver) deliver=true; shift ;;
             --extent)  extent="$2"; shift 2 ;;
-            --match|-m) match_arg="$2"; shift 2 ;;
+            --match) match_arg="$2"; shift 2 ;;
             -*) echo "Unknown flag: $1" >&2; exit 1 ;;
             *)
                 if [ -z "$target" ]; then target="$1"
@@ -847,7 +1207,7 @@ cmd_relay() {
     done
 
     if [ -z "$target" ]; then
-        echo "Usage: txlit relay [--deliver] [--extent <type>] [--match <window>] <target> [label]" >&2
+        echo "Usage: txlit term relay [--deliver] [--extent <type>] [--match <window>] <target> [label]" >&2
         echo "" >&2
         echo "  Grabs output from kitty terminal and sends it as a message." >&2
         echo "" >&2
@@ -859,10 +1219,10 @@ cmd_relay() {
         echo "  --match    Kitty window match expression (default: recent:1)" >&2
         echo "" >&2
         echo "Examples:" >&2
-        echo "  txlit relay backend                    # last cmd output → backend" >&2
-        echo "  txlit relay backend build-error        # with label" >&2
-        echo "  txlit relay --extent selection backend  # selected text → backend" >&2
-        echo "  txlit relay --match title:server backend # from specific window" >&2
+        echo "  txlit term relay backend                    # last cmd output → backend" >&2
+        echo "  txlit term relay backend build-error        # with label" >&2
+        echo "  txlit term relay --extent selection backend  # selected text → backend" >&2
+        echo "  txlit term relay --match title:server backend # from specific window" >&2
         exit 1
     fi
 
@@ -912,19 +1272,139 @@ cmd_relay() {
     echo "$captured" | cmd_compose "${compose_args[@]}"
 }
 
+# --- channels (publish/listen) --------------------------------------
+# Fire-and-forget many-to-one streaming: publishers append JSON-lines to the
+# recipient's channel file; recipient runs `txlit listen` once (typically via
+# Claude's Monitor tool) and sees every publisher's writes as notifications.
+#
+# Channel file: ~/.config/txlit/channels/<recipient-name>.jsonl
+# Record:       {"id","from","ts","body"}
+# `listen` truncates on start (clean slate per session) then `tail -F`s.
+
+cmd_publish() {
+    local target="" body="" stdin_body=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -m) body="$2"; shift 2 ;;
+            -h|--help)
+                cat <<'PUBHELP'
+txlit publish <target> -m '<body>'
+txlit publish <target> <<EOF
+  body
+EOF
+
+Append one JSON-line to <target>'s channel file. Fire-and-forget — no inbox
+entry, no UserPromptSubmit hook, no reply path. Recipient must be running
+`txlit listen` (or otherwise tailing the channel file) to see it live.
+PUBHELP
+                return 0 ;;
+            --) shift; target="${1:-}"; shift || true; break ;;
+            -*) echo "Unknown flag: $1" >&2; return 1 ;;
+            *)  if [ -z "$target" ]; then target="$1"; else echo "Unexpected arg: $1" >&2; return 1; fi; shift ;;
+        esac
+    done
+
+    if [ -z "$target" ]; then
+        echo "Error: target required. Usage: txlit publish <target> [-m body]" >&2
+        return 1
+    fi
+
+    # Body resolution: -m wins; otherwise read stdin if piped
+    if [ -z "$body" ]; then
+        if [ ! -t 0 ]; then
+            stdin_body="$(cat)"
+            body="$stdin_body"
+        fi
+    fi
+    if [ -z "$body" ]; then
+        echo "Error: empty body. Pass -m '<text>' or pipe via stdin." >&2
+        return 1
+    fi
+
+    # Resolve target → namespace (registered name or basename)
+    local target_path target_ns
+    target_path="$(resolve_target "$target")"
+    target_ns="$(resolve_namespace "$target_path")"
+
+    # Resolve sender from current project dir
+    local from_dir from_ns
+    from_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+    from_dir="$(cd "$from_dir" 2>/dev/null && pwd)" || from_dir="$PWD"
+    from_ns="$(resolve_namespace "$from_dir")"
+
+    mkdir -p "$CHANNELS_DIR"
+    local channel_file="${CHANNELS_DIR}/${target_ns}.jsonl"
+
+    local msg_id timestamp record
+    msg_id="$(uuidgen | tr '[:upper:]' '[:lower:]' | cut -c1-32)"
+    timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+    record="$(jq -cn \
+        --arg id "$msg_id" \
+        --arg from "$from_ns" \
+        --arg ts "$timestamp" \
+        --arg body "$body" \
+        '{id:$id, from:$from, ts:$ts, body:$body}')"
+
+    # Append atomically — single write(2) for small records, fine for our scale
+    printf '%s\n' "$record" >> "$channel_file"
+
+    echo "Published to ${target_ns} (${msg_id})"
+}
+
+cmd_listen() {
+    case "${1:-}" in
+        -h|--help|help)
+            cat <<'EOF'
+Usage: txlit listen
+
+Truncate ~/.config/txlit/channels/<me>.jsonl and tail -F it.
+Channel name is derived from the current project (CLAUDE_PROJECT_DIR or PWD).
+One JSON record per appended line — meant to be driven by the Monitor tool.
+
+Takes no arguments.
+EOF
+            return 0
+            ;;
+    esac
+    # Resolve current project name
+    local me_dir me_ns
+    me_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+    me_dir="$(cd "$me_dir" 2>/dev/null && pwd)" || me_dir="$PWD"
+    me_ns="$(resolve_namespace "$me_dir")"
+
+    mkdir -p "$CHANNELS_DIR"
+    local channel_file="${CHANNELS_DIR}/${me_ns}.jsonl"
+    local pidfile="${CHANNELS_DIR}/${me_ns}.pid"
+
+    # Clean slate every session — this is a live stream, not an inbox
+    : > "$channel_file"
+
+    # Record our PID so senders can detect a live listener and skip hook re-delivery
+    echo "$$" > "$pidfile"
+    trap 'rm -f "$pidfile"' EXIT INT TERM HUP
+
+    # Print one banner line to stderr so it doesn't pollute the JSON-line stream
+    echo "Listening on channel: ${me_ns} (${channel_file})" >&2
+
+    # Tail forever, emit each appended line on stdout — one record per Monitor notification
+    # Note: not exec'd so the EXIT trap fires and the pidfile gets cleaned up
+    tail -n 0 -F "$channel_file"
+}
+
 # --- routing --------------------------------------------------------
 case "${1:-}" in
-    install)        shift; cmd_install "$@" ;;
-    uninstall)      shift; cmd_uninstall "$@" ;;
-    init)           shift; cmd_init "$@" ;;
     register)       shift; cmd_register "$@" ;;
+    start)          shift; cmd_start "$@" ;;
     intent)         shift; cmd_intent "$@" ;;
     unregister)     shift; cmd_unregister "$@" ;;
     who)            shift; cmd_who "$@" ;;
     inbox)          shift; cmd_inbox "$@" ;;
     compose)        shift; cmd_compose "$@" ;;
-    grab)           shift; cmd_grab "$@" ;;
-    relay)          shift; cmd_relay "$@" ;;
+    publish|pub)    shift; cmd_publish "$@" ;;
+    listen)         shift; cmd_listen "$@" ;;
+    term)           shift; cmd_term "$@" ;;
     send)           shift; cmd_send "$@" ;;
     list|ls)        shift; cmd_list "$@" ;;
     clear|rm)       shift; cmd_clear "$@" ;;

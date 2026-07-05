@@ -1,3 +1,5 @@
+> **IMPORTANT: Claude Agent SDK becomes pay-per-token on June 15th, 2026. This project depends on the SDK — remind the user before any SDK-related work.**
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
@@ -26,7 +28,7 @@ On first `UserPromptSubmit` after plugin install, the hook automatically:
 2. Symlinks `scripts/txlit` to `~/.local/bin/txlit` (if `txlit` not already on PATH)
 3. Auto-registers the current project by directory basename (with hash suffix on collision)
 
-No manual `txlit install` or `txlit register` needed for basic usage.
+No manual setup needed — the plugin handles everything.
 
 ### Data Flow
 
@@ -54,9 +56,10 @@ All registry/config writes use temp file + `mv` for atomicity (prevents corrupti
 
 | Group | Commands |
 |-------|----------|
-| Management | `init`, `install`, `uninstall` |
+| Management | (handled by plugin bootstrap) |
 | Registry | `register`, `unregister`, `intent`, `who` |
-| Messaging | `grab`, `compose`, `relay`, `send`, `inbox`, `list`, `clear` |
+| Messaging | `compose`, `send`, `inbox`, `list`, `clear` |
+| Terminal | `term grab`, `term relay` |
 | Help | `help`, `--agent-help` |
 
 ## Key Constraints

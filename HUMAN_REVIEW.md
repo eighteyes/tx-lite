@@ -1,5 +1,63 @@
 # Human Review Steps
 
+## Critical Fixes + seed Removal (2026-07-04, uncommitted, session 678ca29d-2dea-419e-94dd-418cb9cec8cd)
+
+### Marketplace Install Path
+- [ ] Verify source points at repo root and versions match:
+```bash
+jq '.plugins[0].source, .metadata.version, .plugins[0].version' ~/projects/tx-lite/.claude-plugin/marketplace.json
+jq '.version' ~/projects/tx-lite/.claude-plugin/plugin.json
+```
+
+### publish Routed to Channels (no longer a send alias)
+- [ ] Publish with a live listener elsewhere (`txlit listen` in another terminal):
+```bash
+txlit publish core -m 'ping'
+```
+- [ ] Verify NO inbox entry was created (fire-and-forget contract):
+```bash
+txlit list
+```
+- [ ] Verify piped-stdin form works:
+```bash
+echo 'ping2' | txlit publish core
+```
+
+### tmux Delivery Fix
+- [ ] Send with --tmux and confirm the target session's claude actually receives a prompt (previously `cat ' '` failed silently):
+```bash
+txlit send <target> -m 'tmux test' --tmux
+```
+
+### Hook: Exact-ID Mark-Read + Missing-Handoff Skip
+- [ ] Queue 2 messages to a project, open Claude there, submit a prompt — both deliver, both marked read:
+```bash
+txlit list
+```
+- [ ] Delete a queued message's handoff .md from ~/.config/txlit/msgs/<ns>/ before prompting — hook should warn and leave it unread (not discard):
+```bash
+jq '.' ~/.config/txlit/messages.json
+```
+
+### messages.json Locking
+- [ ] Fire concurrent sends and confirm none are lost:
+```bash
+for i in 1 2 3 4 5; do txlit send <target> -m "race-$i" & done; wait; txlit list
+```
+- [ ] Confirm no stale lock left behind:
+```bash
+ls -d ~/.config/txlit/.messages.lock 2>/dev/null || echo "no stale lock"
+```
+
+### seed Removed
+- [ ] Confirm command is gone and help has no trace:
+```bash
+txlit seed test 2>&1 | head -1
+txlit help | grep -c seed
+```
+
+---
+
 ## Turn 0: SSH + GitHub Push (2026-02-23)
 
 ### Fix SSH Agent
