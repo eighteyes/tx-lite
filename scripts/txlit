@@ -126,15 +126,20 @@ dual_write_message() {
     local channel_file="${CHANNELS_DIR}/${namespace}.jsonl"
     local from_ns
     from_ns="$(resolve_namespace "$(cd "$from_path" 2>/dev/null && pwd || echo "$from_path")")"
+    # Per-agent identity: distinguishes multiple agents sharing one namespace/channel.
+    # Lets a listener drop its own echoes (see cmd_listen) without dropping a
+    # sibling agent's messages in the same project folder.
+    local from_session="${CLAUDE_CODE_SESSION_ID:-}"
     local body
     body="$(cat "$handoff_path" 2>/dev/null || echo "")"
     jq -cn \
         --arg id "$msg_id" \
         --arg from "$from_ns" \
+        --arg session "$from_session" \
         --arg ts "$timestamp" \
         --arg handoff "$handoff_path" \
         --arg body "$body" \
-        '{id:$id, from:$from, ts:$ts, handoff:$handoff, body:$body}' \
+        '{id:$id, from:$from, from_session:$session, ts:$ts, handoff:$handoff, body:$body}' \
         >> "$channel_file"
 
     # Echo status for caller diagnostics
@@ -1332,6 +1337,7 @@ PUBHELP
     from_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
     from_dir="$(cd "$from_dir" 2>/dev/null && pwd)" || from_dir="$PWD"
     from_ns="$(resolve_namespace "$from_dir")"
+    local from_session="${CLAUDE_CODE_SESSION_ID:-}"
 
     mkdir -p "$CHANNELS_DIR"
     local channel_file="${CHANNELS_DIR}/${target_ns}.jsonl"
@@ -1343,9 +1349,10 @@ PUBHELP
     record="$(jq -cn \
         --arg id "$msg_id" \
         --arg from "$from_ns" \
+        --arg session "$from_session" \
         --arg ts "$timestamp" \
         --arg body "$body" \
-        '{id:$id, from:$from, ts:$ts, body:$body}')"
+        '{id:$id, from:$from, from_session:$session, ts:$ts, body:$body}')"
 
     # Append atomically — single write(2) for small records, fine for our scale
     printf '%s\n' "$record" >> "$channel_file"
@@ -1374,6 +1381,11 @@ EOF
     me_dir="$(cd "$me_dir" 2>/dev/null && pwd)" || me_dir="$PWD"
     me_ns="$(resolve_namespace "$me_dir")"
 
+    # Per-agent identity. When several agents share this folder they share this
+    # one channel file; each stamps its sends with CLAUDE_CODE_SESSION_ID, so we
+    # can suppress our own echoes here without hiding a sibling agent's messages.
+    local me_session="${CLAUDE_CODE_SESSION_ID:-}"
+
     mkdir -p "$CHANNELS_DIR"
     local channel_file="${CHANNELS_DIR}/${me_ns}.jsonl"
     local pidfile="${CHANNELS_DIR}/${me_ns}.pid"
@@ -1390,7 +1402,15 @@ EOF
 
     # Tail forever, emit each appended line on stdout — one record per Monitor notification
     # Note: not exec'd so the EXIT trap fires and the pidfile gets cleaned up
-    tail -n 0 -F "$channel_file"
+    if [ -n "$me_session" ]; then
+        # Drop records this agent sent itself (from_session == me). Records with no
+        # from_session (older/foreign writers) have null != $me → kept. --unbuffered
+        # flushes each line immediately so Monitor sees it live.
+        tail -n 0 -F "$channel_file" \
+            | jq -c --unbuffered --arg me "$me_session" 'select(.from_session != $me)'
+    else
+        tail -n 0 -F "$channel_file"
+    fi
 }
 
 # --- routing --------------------------------------------------------

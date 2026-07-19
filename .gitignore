@@ -1,3 +1,5 @@
 .ai/
 .claude/
 sandbox-deny.log
+raycast/node_modules/
+raycast/dist/

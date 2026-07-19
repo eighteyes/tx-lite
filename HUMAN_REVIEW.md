@@ -1,5 +1,77 @@
 # Human Review Steps
 
+## Suppress self-echo for co-located agents on shared channel (2026-07-12, uncommitted, session 82e8a3d4-5509-42ce-9a6c-d3134de4edd5)
+
+Channel files are keyed by namespace (project folder), so multiple agents in one
+folder share `channels/<ns>.jsonl`. Sends were echoed back into the sender's own
+`txlit listen`. Fix stamps each channel record with `from_session`
+(`CLAUDE_CODE_SESSION_ID`) and has `listen` drop records whose `from_session`
+matches its own — a sibling agent in the same folder still receives them.
+
+### Two agents, same folder
+- [ ] Open two Claude sessions in the same project directory
+- [ ] In each, start a listener:
+```bash
+txlit listen
+```
+- [ ] From agent A, publish to the shared namespace:
+```bash
+txlit publish <this-project-name> -m "ping from A"
+```
+- [ ] Confirm agent B's listener shows the record; agent A's listener does NOT echo it
+
+### Record carries session id
+- [ ] Inspect the channel file — records should include a `from_session` field:
+```bash
+jq -c '{from, from_session, body}' ~/.config/txlit/channels/<this-project-name>.jsonl
+```
+
+### Legacy / cross-project records still delivered
+- [ ] A record with no `from_session` (or a different session) must still appear in every listener:
+```bash
+printf '%s\n' '{"id":"x","from":"other","body":"no session field"}' >> ~/.config/txlit/channels/<this-project-name>.jsonl
+```
+- [ ] Confirm it surfaces in the running listener
+
+
+## Raycast Extension Revival (2026-07-04, uncommitted, session 678ca29d-2dea-419e-94dd-418cb9cec8cd)
+
+### Load in Raycast
+- [ ] Start dev mode (imports the extension into Raycast automatically):
+```bash
+cd ~/projects/tx-lite/raycast && npx ray develop
+```
+- [ ] In Raycast, confirm two commands appear: "Send to Recipient", "Compose & Send" (AI Routing removed 2026-07-04)
+
+### PATH Resolution (fixed: extension no longer depends on shell PATH)
+- [ ] Verify the symlink the extension checks first still exists:
+```bash
+ls -la ~/.local/bin/txlit
+```
+- [ ] Verify jq is where the augmented PATH expects it:
+```bash
+ls /opt/homebrew/bin/jq
+```
+
+### Send to Recipient (no API key needed)
+- [ ] Select text in any app, trigger "Send to Recipient", choose a target
+- [ ] Verify delivery:
+```bash
+txlit list
+```
+
+### Compose Form
+- [ ] Trigger "Compose & Send" — form should pre-fill from clipboard with recipient dropdown
+- [ ] Submit and verify with:
+```bash
+txlit list
+```
+
+### Locale Fix
+- [ ] Re-run a send from Raycast — the "cannot change locale" error should be gone. If any error remains, note the exact toast text (it now carries real stderr, not locale noise)
+
+---
+
 ## Critical Fixes + seed Removal (2026-07-04, uncommitted, session 678ca29d-2dea-419e-94dd-418cb9cec8cd)
 
 ### Marketplace Install Path
